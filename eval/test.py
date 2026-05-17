@@ -72,13 +72,9 @@ def build_model_from_cfg(cfg, device):
         num_classes=mcfg['num_classes'],
         pair_input_dim=mcfg['pair_input_dim'],
         pair_extra_dim=mcfg['pair_extra_dim'],
-        embed_dim=mcfg['embed_dim'],
-        d_model_embed=mcfg['d_model_embed'],
-        n_synch_embed=mcfg['n_synch_embed'],
-        d_model_pair=mcfg['d_model_pair'],
-        n_synch_pair=mcfg['n_synch_pair'],
-        d_model_head=mcfg['d_model_head'],
-        n_synch_head=mcfg['n_synch_head'],
+        embed_dims=tuple(mcfg['embed_dims']),
+        pair_embed_dims=tuple(mcfg['pair_embed_dims']),
+        use_pre_activation_pair=mcfg['use_pre_activation_pair'],
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
         memory_length=mcfg['memory_length'],
@@ -88,6 +84,8 @@ def build_model_from_cfg(cfg, device):
         n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
         trim=mcfg['trim'],
+        fc_params=tuple(tuple(x) for x in mcfg['fc_params']),
+        activation=mcfg['activation'],
     ).to(device)
     return model
 

@@ -33,13 +33,8 @@ def main():
 
     model = ParticleCTM(
         input_dim=C, num_classes=10,
-        embed_dim=64,
-        d_model_embed=64,
-        n_synch_embed=8,
-        d_model_pair=16,
-        n_synch_pair=4,
-        d_model_head=64,
-        n_synch_head=8,
+        embed_dims=(64, 64),
+        pair_embed_dims=(32, 32),
         num_heads=4,
         iterations=3,
         memory_length=4,

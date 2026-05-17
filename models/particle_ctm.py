@@ -1,17 +1,15 @@
-"""ParticleCTM: every neuron pool is now NLM + Synchronization.
-
-Four CTM pools are threaded through the same outer-tick loop:
-    - CTMEmbed:     per-particle embedding (replaces ParT MLP).
-    - CTMPairEmbed: per-pair attention bias (replaces ParT Conv1d stack).
-    - CTMAttention: Q/K/V/O projections (already NLM+Sync).
-    - CTMHead:      class logits (replaces the linear classification MLP).
+"""ParticleCTM: ParticleTransformer-style tokenisation + pair embedding +
+class token, but with the multiple particle/class attention blocks replaced by
+a single `CTMAttention` block iterated for `iterations` outer ticks.
 
 Per outer tick:
-    1. CTMEmbed(x) -> particle tokens (state threaded across ticks).
-    2. CTMPairEmbed(v) -> (B, num_heads, 1+P, 1+P) additive bias.
-    3. CTMAttention over (cls + particle) tokens.
-    4. CTMHead on the cls slot -> logits.
-    5. Normalised-entropy certainty.
+    1. self-attention over (cls + particle) tokens with pair-embedding bias
+       (zero bias on cls row/col).
+    2. take the cls slot of the output → linear head → logits.
+    3. compute normalised-entropy certainty.
+
+State (`trace_*`, `decay_alpha_*`, `decay_beta_*`) is threaded across ticks by
+CTMAttention itself; the rest of the module is stateless within a forward.
 """
 
 import torch
@@ -19,10 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .ctm.ctm_attention import CTMAttention
-from .ctm.ctm_embed import CTMEmbed
-from .ctm.ctm_head import CTMHead
-from .ctm.ctm_pair_embed import CTMPairEmbed
-from .part_layers import SequenceTrimmer, trunc_normal_
+from .part_layers import Embed, PairEmbed, SequenceTrimmer, trunc_normal_
 
 
 def compute_normalized_entropy(logits, reduction='mean'):
@@ -41,17 +36,12 @@ class ParticleCTM(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=10,
-                 # Pair-embed config
+                 # ParT-style embedding/pair config
                  pair_input_dim=4,
                  pair_extra_dim=0,
-                 # Per-pool widths
-                 embed_dim=128,
-                 d_model_embed=128,
-                 n_synch_embed=32,
-                 d_model_pair=32,
-                 n_synch_pair=8,
-                 d_model_head=128,
-                 n_synch_head=32,
+                 embed_dims=(128, 512, 128),
+                 pair_embed_dims=(64, 64, 64),
+                 use_pre_activation_pair=False,
                  # CTMAttention config
                  num_heads=8,
                  iterations=8,
@@ -62,34 +52,26 @@ class ParticleCTM(nn.Module):
                  n_synch_o=32,
                  dropout=0.0,
                  # misc
-                 trim=True):
+                 trim=True,
+                 fc_params=(),
+                 activation='gelu'):
         super().__init__()
 
+        embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         self.embed_dim = embed_dim
         self.iterations = iterations
         self.num_heads = num_heads
         self.num_classes = num_classes
 
         self.trimmer = SequenceTrimmer(enabled=trim)
-
-        self.embed = CTMEmbed(
-            input_dim=input_dim,
-            embed_dim=embed_dim,
-            n_neurons=d_model_embed,
-            memory_length=memory_length,
-            n_synch=n_synch_embed,
-            dropout=dropout,
-        )
-
-        self.pair_embed = CTMPairEmbed(
-            pairwise_lv_dim=pair_input_dim,
-            pairwise_input_dim=pair_extra_dim,
-            num_heads=num_heads,
-            n_neurons=d_model_pair,
-            memory_length=memory_length,
-            n_synch=n_synch_pair,
-            dropout=dropout,
-        ) if pair_input_dim > 0 else None
+        self.embed = Embed(input_dim, list(embed_dims), activation=activation) \
+            if len(embed_dims) > 0 else nn.Identity()
+        self.pair_embed = PairEmbed(
+            pair_input_dim, pair_extra_dim,
+            list(pair_embed_dims) + [num_heads],
+            remove_self_pair=False,
+            use_pre_activation_pair=use_pre_activation_pair,
+        ) if pair_embed_dims is not None and pair_input_dim + pair_extra_dim > 0 else None
 
         self.ctm_attention = CTMAttention(
             embed_dim=embed_dim,
@@ -101,73 +83,86 @@ class ParticleCTM(nn.Module):
             n_synch_o=n_synch_o,
             dropout=dropout,
         )
-
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.head = CTMHead(
-            embed_dim=embed_dim,
-            num_classes=num_classes,
-            n_neurons=d_model_head,
-            memory_length=memory_length,
-            n_synch=n_synch_head,
-            dropout=dropout,
-        )
+        if fc_params:
+            fcs = []
+            in_dim = embed_dim
+            for out_dim, drop in fc_params:
+                fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop)))
+                in_dim = out_dim
+            fcs.append(nn.Linear(in_dim, num_classes))
+            self.head = nn.Sequential(*fcs)
+        else:
+            self.head = nn.Linear(embed_dim, num_classes)
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         trunc_normal_(self.cls_token, std=0.02)
 
-    def _expand_attn_bias(self, pair_bias):
-        """Add a zero cls row/col to a (B, num_heads, P, P) pair bias and
-        return (B, num_heads, 1+P, 1+P)."""
-        B, H, P, _ = pair_bias.shape
-        out = pair_bias.new_zeros(B, H, P + 1, P + 1)
-        out[:, :, 1:, 1:] = pair_bias
+    def _build_attn_bias(self, v, mask, P):
+        """pair_embed(v) → (B, num_heads, P, P); pad with zero cls row/col.
+
+        Returns (B, num_heads, 1+P, 1+P) additive attention bias, which
+        broadcasts with the (B, num_heads, L_q, L_kv) logits inside CTMAttention.
+        """
+        if self.pair_embed is None:
+            return None
+        bias = self.pair_embed(v, None)  # (B, num_heads, P, P)
+        B = bias.size(0)
+        out = bias.new_zeros(B, self.num_heads, P + 1, P + 1)
+        out[:, :, 1:, 1:] = bias
         return out
 
     def forward(self, x, v=None, mask=None, track=False):
-        """x: (B, C, P); v: (B, 4, P); mask: (B, 1, P)."""
+        """
+        x:    (B, C, P) particle features
+        v:    (B, 4, P) (px, py, pz, energy) — fed to PairEmbed for the bias
+        mask: (B, 1, P) boolean / 0-1; 1 = real particle, 0 = padding
+        """
+        # 1. trim padding columns
         x, v, mask, _ = self.trimmer(x, v, mask, None)
         B, _, P = x.shape
         device = x.device
 
+        # 2. particle embedding: (P, B, embed_dim) then back to (B, P, embed_dim)
+        tokens = self.embed(x)
+        if tokens.dim() == 3 and tokens.size(0) == P and tokens.size(1) == B:
+            tokens = tokens.permute(1, 0, 2).contiguous()
+        # zero out padded particles
+        tokens = tokens.masked_fill(~mask.squeeze(1).unsqueeze(-1), 0.0)
+
+        # 3. prepend cls token
+        cls = self.cls_token.expand(B, 1, self.embed_dim)
+        seq = torch.cat([cls, tokens], dim=1)  # (B, 1+P, embed_dim)
+
+        # 4. padding mask for the full (1+P) sequence: cls is never padded
         cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        # particles: True where padded
         particle_pad = ~mask.squeeze(1).bool()
         kp_mask = torch.cat([cls_mask, particle_pad], dim=1)  # (B, 1+P)
-        particle_keep = (~particle_pad).unsqueeze(-1)         # (B, P, 1)
 
+        # 5. pair-embedding attention bias (B*num_heads, 1+P, 1+P)
+        attn_mask = self._build_attn_bias(v, mask, P) if v is not None else None
+
+        # 6. T outer ticks of CTMAttention
         T = self.iterations
-        predictions = torch.empty(B, self.num_classes, T, device=device, dtype=x.dtype)
-        certainties = torch.empty(B, 2, T, device=device, dtype=x.dtype)
+        predictions = torch.empty(B, self.num_classes, T, device=device, dtype=seq.dtype)
+        certainties = torch.empty(B, 2, T, device=device, dtype=seq.dtype)
 
         attn_history = [] if track else None
         token_history = [] if track else None
         sync_o_history = [] if track else None
 
-        embed_state = None
-        pair_state = None
-        attn_state = None
-        head_state = None
-
+        state = None
         for t in range(T):
-            tokens, embed_state = self.embed(x, embed_state)        # (B, P, embed_dim)
-            tokens = tokens.masked_fill(~particle_keep, 0.0)
-            cls = self.cls_token.expand(B, 1, self.embed_dim)
-            seq = torch.cat([cls, tokens], dim=1)                   # (B, 1+P, embed_dim)
-
-            if self.pair_embed is not None and v is not None:
-                pair_bias, pair_state = self.pair_embed(v, P, pair_state)
-                attn_mask = self._expand_attn_bias(pair_bias)
-            else:
-                attn_mask = None
-
-            out, attn_w, attn_state = self.ctm_attention(
-                seq, seq, seq, state=attn_state,
+            out, attn_w, state = self.ctm_attention(
+                seq, seq, seq, state=state,
                 attn_mask=attn_mask,
                 key_padding_mask=kp_mask,
                 need_weights=track,
             )
             cls_out = self.norm(out[:, 0])
-            logits, head_state = self.head(cls_out, head_state)
+            logits = self.head(cls_out)
             ne = compute_normalized_entropy(logits)
             certainty = torch.stack((ne, 1 - ne), dim=-1)
 
@@ -177,8 +172,7 @@ class ParticleCTM(nn.Module):
             if track:
                 attn_history.append(attn_w)
                 token_history.append(out.detach().cpu().numpy())
-                sync_o_history.append(
-                    attn_state['o']['decay_alpha'].mean(dim=1).detach().cpu().numpy())
+                sync_o_history.append(state['decay_alpha_o'].mean(dim=1).detach().cpu().numpy())
 
         if track:
             return predictions, certainties, attn_history, token_history, sync_o_history
@@ -186,6 +180,11 @@ class ParticleCTM(nn.Module):
 
 
 def get_loss(predictions, certainties, targets, use_most_certain=True):
+    """Certainty-based loss from CTM examples 01/07.
+
+    Picks two ticks per sample (argmin-loss and argmax-certainty) and averages
+    cross-entropy at those ticks.
+    """
     losses = nn.CrossEntropyLoss(reduction='none')(
         predictions,
         torch.repeat_interleave(targets.unsqueeze(-1), predictions.size(-1), -1),

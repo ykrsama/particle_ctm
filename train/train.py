@@ -163,13 +163,9 @@ def train_worker(cfg):
         num_classes=mcfg['num_classes'],
         pair_input_dim=mcfg['pair_input_dim'],
         pair_extra_dim=mcfg['pair_extra_dim'],
-        embed_dim=mcfg['embed_dim'],
-        d_model_embed=mcfg['d_model_embed'],
-        n_synch_embed=mcfg['n_synch_embed'],
-        d_model_pair=mcfg['d_model_pair'],
-        n_synch_pair=mcfg['n_synch_pair'],
-        d_model_head=mcfg['d_model_head'],
-        n_synch_head=mcfg['n_synch_head'],
+        embed_dims=tuple(mcfg['embed_dims']),
+        pair_embed_dims=tuple(mcfg['pair_embed_dims']),
+        use_pre_activation_pair=mcfg['use_pre_activation_pair'],
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
         memory_length=mcfg['memory_length'],
@@ -179,20 +175,19 @@ def train_worker(cfg):
         n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
         trim=mcfg['trim'],
+        fc_params=tuple(tuple(x) for x in mcfg['fc_params']),
+        activation=mcfg['activation'],
     ).to(device)
     model = ray.train.torch.prepare_model(model)
 
-    # Clamp decay params before every forward (CTM stability). Walk every
-    # CTMPool in the model so embed/pair/attn/head pools are all covered.
+    # Clamp decay params before every forward (CTM stability).
     base_model = model.module if hasattr(model, 'module') else model
-    from particle_ctm.models.ctm.ctm_pool import CTMPool
-    _pool_decay_params = [m.decay_params for m in base_model.modules()
-                          if isinstance(m, CTMPool)]
 
     def clamp_decay_params(_module, _input):
         with torch.no_grad():
-            for p in _pool_decay_params:
-                p.data.clamp_(0, 15)
+            for name in ('decay_params_q', 'decay_params_k',
+                         'decay_params_v', 'decay_params_o'):
+                getattr(base_model.ctm_attention, name).data.clamp_(0, 15)
     model.register_forward_pre_hook(clamp_decay_params)
 
     # Data — file-level sharding by rank.
