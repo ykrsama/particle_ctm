@@ -1,28 +1,31 @@
-"""ParticleCTM: every neuron pool is now NLM + Synchronization.
+"""ParticleCTM: single global CTM neuron pool, every module is a readout.
 
-Four CTM pools are threaded through the same outer-tick loop:
-    - CTMEmbed:     per-particle embedding (replaces ParT MLP).
-    - CTMPairEmbed: per-pair attention bias (replaces ParT Conv1d stack).
-    - CTMAttention: Q/K/V/O projections (already NLM+Sync).
-    - CTMHead:      class logits (replaces the linear classification MLP).
+One `GlobalCTMPool` holds a (B, N_global) latent state and produces one sync
+vector per outer tick. Seven readout Linears (embed / pair / Q / K / V / O /
+head) all consume the SAME sync_{t-1} in parallel within each tick - none of
+them have their own trace, NLM, or sync. At the end of the tick the mean-
+pooled attention output drives a single pre-activation into the global pool
+to produce sync_t for the next tick.
 
-Per outer tick:
-    1. CTMEmbed(x) -> particle tokens (state threaded across ticks).
-    2. CTMPairEmbed(v) -> (B, num_heads, 1+P, 1+P) additive bias.
-    3. CTMAttention over (cls + particle) tokens.
-    4. CTMHead on the cls slot -> logits.
-    5. Normalised-entropy certainty.
+Per outer tick t (sync_{t-1} carried over from tick t-1, sync_0 from
+`GlobalCTMPool.initial_sync`):
+    1. tokens = embed_readout([x, sync_{t-1}])                   # (B, P, embed_dim)
+    2. bias   = pair_readout([pair_geom_feats, sync_{t-1}])      # (B, H, P, P)
+    3. Q/K/V  = q/k/v_readout([tokens, sync_{t-1}])              # (B, P, embed_dim)
+    4. attn   = scaled_dot_product(Q, K, V) + bias               # standard attn
+    5. o      = o_readout([attn, sync_{t-1}])                    # (B, P, embed_dim)
+    6. logits = head_readout(sync_{t-1})                         # (B, num_classes)
+    7. pool_in = masked_mean(o, particles); sync_t = global_pool.step(pool_in)
 """
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .ctm.ctm_attention import CTMAttention
-from .ctm.ctm_embed import CTMEmbed
-from .ctm.ctm_head import CTMHead
-from .ctm.ctm_pair_embed import CTMPairEmbed
-from .part_layers import SequenceTrimmer, trunc_normal_
+from .ctm.global_pool import GlobalCTMPool
+from .part_layers import SequenceTrimmer, pairwise_lv_fts
 
 
 def compute_normalized_entropy(logits, reduction='mean'):
@@ -41,88 +44,99 @@ class ParticleCTM(nn.Module):
     def __init__(self,
                  input_dim,
                  num_classes=10,
-                 # Pair-embed config
                  pair_input_dim=4,
                  pair_extra_dim=0,
-                 # Per-pool widths
                  embed_dim=128,
-                 d_model_embed=128,
-                 n_synch_embed=32,
-                 d_model_pair=32,
-                 n_synch_pair=8,
-                 d_model_head=128,
-                 n_synch_head=32,
-                 # CTMAttention config
                  num_heads=8,
                  iterations=8,
-                 memory_length=10,
-                 d_model_qkv=128,
-                 d_model_o=128,
-                 n_synch_qkv=32,
-                 n_synch_o=32,
+                 # Global pool config
+                 n_global=128,
+                 n_synch_global=16,
+                 memory_length=16,
                  dropout=0.0,
-                 # misc
                  trim=True):
         super().__init__()
+        if pair_extra_dim != 0:
+            raise NotImplementedError(
+                "pair_extra_dim != 0 not supported in the global-pool architecture")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
 
-        self.embed_dim = embed_dim
-        self.iterations = iterations
-        self.num_heads = num_heads
+        self.input_dim = input_dim
         self.num_classes = num_classes
+        self.pair_input_dim = pair_input_dim
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.iterations = iterations
+        self.dropout_p = dropout
 
         self.trimmer = SequenceTrimmer(enabled=trim)
+        self.input_bn = nn.BatchNorm1d(input_dim)
+        self.pair_bn = nn.BatchNorm1d(pair_input_dim) if pair_input_dim > 0 else None
 
-        self.embed = CTMEmbed(
-            input_dim=input_dim,
-            embed_dim=embed_dim,
-            n_neurons=d_model_embed,
+        self.global_pool = GlobalCTMPool(
+            d_pool_in=embed_dim,
+            n_neurons=n_global,
             memory_length=memory_length,
-            n_synch=n_synch_embed,
+            n_synch=n_synch_global,
             dropout=dropout,
         )
+        ssize = self.global_pool.sync_size
 
-        self.pair_embed = CTMPairEmbed(
-            pairwise_lv_dim=pair_input_dim,
-            pairwise_input_dim=pair_extra_dim,
-            num_heads=num_heads,
-            n_neurons=d_model_pair,
-            memory_length=memory_length,
-            n_synch=n_synch_pair,
-            dropout=dropout,
-        ) if pair_input_dim > 0 else None
-
-        self.ctm_attention = CTMAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            memory_length=memory_length,
-            d_model_qkv=d_model_qkv,
-            d_model_o=d_model_o,
-            n_synch_qkv=n_synch_qkv,
-            n_synch_o=n_synch_o,
-            dropout=dropout,
-        )
+        # All readouts: take their specific data input concatenated with the
+        # shared sync_{t-1} vector and project to the target dimension.
+        self.embed_readout = nn.Linear(input_dim + ssize, embed_dim)
+        self.pair_readout = nn.Linear(pair_input_dim + ssize, num_heads) \
+            if pair_input_dim > 0 else None
+        self.q_readout = nn.Linear(embed_dim + ssize, embed_dim)
+        self.k_readout = nn.Linear(embed_dim + ssize, embed_dim)
+        self.v_readout = nn.Linear(embed_dim + ssize, embed_dim)
+        self.o_readout = nn.Linear(embed_dim + ssize, embed_dim)
+        self.head_readout = nn.Linear(ssize, num_classes)
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.head = CTMHead(
-            embed_dim=embed_dim,
-            num_classes=num_classes,
-            n_neurons=d_model_head,
-            memory_length=memory_length,
-            n_synch=n_synch_head,
-            dropout=dropout,
-        )
+    def _compute_pair_geom(self, v, P):
+        """Returns (B, num_pairs, pair_input_dim) pair features in row-major
+        tril-with-diagonal order, plus the (i, j) indices used for scatter."""
+        i, j = torch.tril_indices(P, P, offset=0, device=v.device)
+        v_exp = v.unsqueeze(-1).expand(-1, -1, -1, P)
+        vi = v_exp[:, :, i, j]
+        vj = v_exp[:, :, j, i]
+        feats = pairwise_lv_fts(vi, vj, num_outputs=self.pair_input_dim)
+        return feats, i, j
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        trunc_normal_(self.cls_token, std=0.02)
+    def _scatter_pair_bias(self, bias_flat, i, j, B, P):
+        """bias_flat: (B, num_pairs, num_heads). Returns (B, num_heads, P, P)."""
+        bias = bias_flat.transpose(1, 2).contiguous()  # (B, num_heads, num_pairs)
+        y = bias.new_zeros(B, self.num_heads, P, P)
+        y[:, :, i, j] = bias
+        y[:, :, j, i] = bias
+        return y
 
-    def _expand_attn_bias(self, pair_bias):
-        """Add a zero cls row/col to a (B, num_heads, P, P) pair bias and
-        return (B, num_heads, 1+P, 1+P)."""
-        B, H, P, _ = pair_bias.shape
-        out = pair_bias.new_zeros(B, H, P + 1, P + 1)
-        out[:, :, 1:, 1:] = pair_bias
-        return out
+    def _attention(self, Q, K, V, bias, kp_mask, need_weights):
+        """Standard scaled-dot-product attention. Q/K/V: (B, P, embed_dim)."""
+        B, P, _ = Q.shape
+
+        def split_heads(t):
+            return t.reshape(B, P, self.num_heads, self.head_dim).transpose(1, 2)
+
+        Qh, Kh, Vh = split_heads(Q), split_heads(K), split_heads(V)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * scale  # (B, H, P, P)
+        if bias is not None:
+            logits = logits + bias
+        if kp_mask is not None:
+            kp_add = torch.zeros(B, 1, 1, P, device=Q.device, dtype=Q.dtype)
+            kp_add = kp_add.masked_fill(kp_mask.view(B, 1, 1, P), float('-inf'))
+            logits = logits + kp_add
+        weights = F.softmax(logits, dim=-1)
+        dropped = F.dropout(weights, p=self.dropout_p, training=self.training)
+        out = torch.matmul(dropped, Vh)                          # (B, H, P, head_dim)
+        out = out.transpose(1, 2).reshape(B, P, self.embed_dim)  # (B, P, embed_dim)
+        return out, (weights if need_weights else None)
 
     def forward(self, x, v=None, mask=None, track=False):
         """x: (B, C, P); v: (B, 4, P); mask: (B, 1, P)."""
@@ -130,10 +144,17 @@ class ParticleCTM(nn.Module):
         B, _, P = x.shape
         device = x.device
 
-        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
-        particle_pad = ~mask.squeeze(1).bool()
-        kp_mask = torch.cat([cls_mask, particle_pad], dim=1)  # (B, 1+P)
-        particle_keep = (~particle_pad).unsqueeze(-1)         # (B, P, 1)
+        x_bn = self.input_bn(x).transpose(1, 2).contiguous()  # (B, P, C)
+        particle_pad = ~mask.squeeze(1).bool()                 # (B, P) True at pad
+        keep = (~particle_pad).to(x.dtype).unsqueeze(-1)       # (B, P, 1)
+        keep_sum = keep.sum(dim=1).clamp(min=1.0)              # (B, 1)
+
+        if self.pair_readout is not None and v is not None:
+            with torch.no_grad():
+                pair_geom, i_idx, j_idx = self._compute_pair_geom(v, P)
+            pair_geom = self.pair_bn(pair_geom).transpose(1, 2).contiguous()
+        else:
+            pair_geom = i_idx = j_idx = None
 
         T = self.iterations
         predictions = torch.empty(B, self.num_classes, T, device=device, dtype=x.dtype)
@@ -141,48 +162,80 @@ class ParticleCTM(nn.Module):
 
         attn_history = [] if track else None
         token_history = [] if track else None
-        sync_o_history = [] if track else None
+        sync_history = [] if track else None
 
-        embed_state = None
-        pair_state = None
-        attn_state = None
-        head_state = None
+        sync = self.global_pool.initial_sync(B, device, x.dtype)  # sync_0 (B, ssize)
+        pool_state = None
+        ssize = sync.size(-1)
 
         for t in range(T):
-            tokens, embed_state = self.embed(x, embed_state)        # (B, P, embed_dim)
-            tokens = tokens.masked_fill(~particle_keep, 0.0)
-            cls = self.cls_token.expand(B, 1, self.embed_dim)
-            seq = torch.cat([cls, tokens], dim=1)                   # (B, 1+P, embed_dim)
+            sync_p = sync.unsqueeze(1).expand(B, P, ssize)        # (B, P, ssize)
 
-            if self.pair_embed is not None and v is not None:
-                pair_bias, pair_state = self.pair_embed(v, P, pair_state)
-                attn_mask = self._expand_attn_bias(pair_bias)
+            tokens = self.embed_readout(torch.cat([x_bn, sync_p], dim=-1))  # (B, P, embed_dim)
+            tokens = tokens * keep
+
+            if pair_geom is not None:
+                sync_pp = sync.unsqueeze(1).expand(B, pair_geom.size(1), ssize)
+                bias_flat = self.pair_readout(torch.cat([pair_geom, sync_pp], dim=-1))
+                bias = self._scatter_pair_bias(bias_flat, i_idx, j_idx, B, P)
             else:
-                attn_mask = None
+                bias = None
 
-            out, attn_w, attn_state = self.ctm_attention(
-                seq, seq, seq, state=attn_state,
-                attn_mask=attn_mask,
-                key_padding_mask=kp_mask,
-                need_weights=track,
-            )
-            cls_out = self.norm(out[:, 0])
-            logits, head_state = self.head(cls_out, head_state)
+            tok_sync = torch.cat([tokens, sync_p], dim=-1)
+            Q = self.q_readout(tok_sync)
+            K = self.k_readout(tok_sync)
+            V = self.v_readout(tok_sync)
+
+            attn_out, attn_w = self._attention(Q, K, V, bias, particle_pad, track)
+            o = self.o_readout(torch.cat([attn_out, sync_p], dim=-1)) * keep
+
+            logits = self.head_readout(sync)                      # uses sync_{t-1}
+
+            # Drive the global pool with the masked-mean of o → sync_t.
+            pool_in = (o * keep).sum(dim=1) / keep_sum            # (B, embed_dim)
+            pool_in = self.norm(pool_in)
+            sync, pool_state = self.global_pool.step(pool_in, pool_state)
+
             ne = compute_normalized_entropy(logits)
             certainty = torch.stack((ne, 1 - ne), dim=-1)
-
             predictions[..., t] = logits
             certainties[..., t] = certainty
 
             if track:
                 attn_history.append(attn_w)
-                token_history.append(out.detach().cpu().numpy())
-                sync_o_history.append(
-                    attn_state['o']['decay_alpha'].mean(dim=1).detach().cpu().numpy())
+                token_history.append(o.detach().cpu().numpy())
+                sync_history.append(sync.detach().cpu().numpy())
 
         if track:
-            return predictions, certainties, attn_history, token_history, sync_o_history
+            return predictions, certainties, attn_history, token_history, sync_history
         return predictions, certainties
+
+
+def summarize_parameters(model):
+    """Per-top-level-child parameter counts plus model total."""
+    def _fmt(n):
+        return f'{n:>13,d}'
+
+    children = list(model.named_children())
+    name_w = max([len(n) for n, _ in children] + [5])
+
+    lines = ['Parameter breakdown:']
+    total = 0
+    total_train = 0
+    for name, child in children:
+        n = sum(p.numel() for p in child.parameters())
+        nt = sum(p.numel() for p in child.parameters() if p.requires_grad)
+        total += n
+        total_train += nt
+        lines.append(f'  {name:<{name_w}}  total={_fmt(n)}  trainable={_fmt(nt)}')
+    direct = sum(p.numel() for p in model.parameters(recurse=False))
+    if direct:
+        lines.append(f'  {"(direct)":<{name_w}}  total={_fmt(direct)}  trainable={_fmt(direct)}')
+        total += direct
+        total_train += direct
+    lines.append('  ' + '-' * (name_w + 40))
+    lines.append(f'  {"TOTAL":<{name_w}}  total={_fmt(total)}  trainable={_fmt(total_train)}')
+    return '\n'.join(lines)
 
 
 def get_loss(predictions, certainties, targets, use_most_certain=True):

@@ -27,7 +27,7 @@ from particle_ctm.data.jetclass import (  # noqa: E402
     LABELS, build_dataloader, NUM_FEATURES, NUM_CLASSES,
 )
 from particle_ctm.models.particle_ctm import (  # noqa: E402
-    ParticleCTM, get_loss, calculate_accuracy,
+    ParticleCTM, get_loss, calculate_accuracy, summarize_parameters,
 )
 
 
@@ -124,7 +124,7 @@ def train_worker(cfg):
 
     from particle_ctm.data.jetclass import build_dataloader
     from particle_ctm.models.particle_ctm import (
-        ParticleCTM, get_loss, calculate_accuracy,
+        ParticleCTM, get_loss, calculate_accuracy, summarize_parameters,
     )
 
     rank = ray.train.get_context().get_world_rank()
@@ -164,35 +164,25 @@ def train_worker(cfg):
         pair_input_dim=mcfg['pair_input_dim'],
         pair_extra_dim=mcfg['pair_extra_dim'],
         embed_dim=mcfg['embed_dim'],
-        d_model_embed=mcfg['d_model_embed'],
-        n_synch_embed=mcfg['n_synch_embed'],
-        d_model_pair=mcfg['d_model_pair'],
-        n_synch_pair=mcfg['n_synch_pair'],
-        d_model_head=mcfg['d_model_head'],
-        n_synch_head=mcfg['n_synch_head'],
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
+        n_global=mcfg['n_global'],
+        n_synch_global=mcfg['n_synch_global'],
         memory_length=mcfg['memory_length'],
-        d_model_qkv=mcfg['d_model_qkv'],
-        d_model_o=mcfg['d_model_o'],
-        n_synch_qkv=mcfg['n_synch_qkv'],
-        n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
         trim=mcfg['trim'],
     ).to(device)
+    if rank == 0:
+        print(summarize_parameters(model))
     model = ray.train.torch.prepare_model(model)
 
-    # Clamp decay params before every forward (CTM stability). Walk every
-    # CTMPool in the model so embed/pair/attn/head pools are all covered.
+    # Clamp the global pool's decay_params before every forward (CTM stability).
     base_model = model.module if hasattr(model, 'module') else model
-    from particle_ctm.models.ctm.ctm_pool import CTMPool
-    _pool_decay_params = [m.decay_params for m in base_model.modules()
-                          if isinstance(m, CTMPool)]
+    _decay_params = base_model.global_pool.decay_params
 
     def clamp_decay_params(_module, _input):
         with torch.no_grad():
-            for p in _pool_decay_params:
-                p.data.clamp_(0, 15)
+            _decay_params.data.clamp_(0, 15)
     model.register_forward_pre_hook(clamp_decay_params)
 
     # Data — file-level sharding by rank.
