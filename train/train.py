@@ -48,6 +48,19 @@ def _label_hist(labels, num_classes, key_name):
     return _wandb.plot.bar(table, 'class', 'count', title=key_name)
 
 
+def _confusion_plot(true_labels, pred_labels, num_classes, title):
+    """2D heatmap: true label (row) vs predicted label (col). Useful to see
+    whether the model's mistakes are class-specific."""
+    import wandb as _wandb
+    class_names = [lbl.replace('label_', '') for lbl in LABELS][:num_classes]
+    return _wandb.plot.confusion_matrix(
+        y_true=list(map(int, true_labels)),
+        preds=list(map(int, pred_labels)),
+        class_names=class_names,
+        title=title,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
@@ -137,6 +150,11 @@ def train_worker(cfg):
             config={k: v for k, v in cfg.items() if not k.startswith('_')},
             dir=run_dir,
         )
+        # Use `step` from each log dict as the x-axis for every metric.
+        # Without this, wandb auto-increments its own internal counter (the
+        # 0,1,2,... we were seeing on the x-axis).
+        wandb.define_metric('step')
+        wandb.define_metric('*', step_metric='step')
 
     # Model
     mcfg = cfg['model']
@@ -299,8 +317,9 @@ def train_worker(cfg):
                     'data/wait_ms_peak': data_wait_peak,
                     'train/true_label_dist':
                         _label_hist(true_now, mcfg['num_classes'], 'train true labels'),
-                    'train/pred_label_dist':
-                        _label_hist(pred_now, mcfg['num_classes'], 'train predicted labels'),
+                    'train/confusion':
+                        _confusion_plot(true_now, pred_now, mcfg['num_classes'],
+                                        'train true vs predicted'),
                     'step': step,
                 })
 
