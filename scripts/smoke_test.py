@@ -35,7 +35,8 @@ def main():
 
     model = ParticleCTM(
         input_dim=C, num_classes=10,
-        embed_dim=64,
+        particle_embed_dim=64,
+        pair_embed_dim=32,
         num_heads=4,
         iterations=3,
         n_global=64,
