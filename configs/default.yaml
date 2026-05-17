@@ -2,11 +2,16 @@
 
 data:
   # Adjust these globs once your downloads finish.
-  train_glob: datasets/JetClass/train_100M/*.root
-  val_glob:   datasets/JetClass/val_5M/*.root
-  test_glob:  datasets/JetClass/test_20M/*.root
+  train_glob: datasets/JetClass/Pythia/train_100M/*.root
+  val_glob:   datasets/JetClass/Pythia/val_5M/*.root
+  test_glob:  datasets/JetClass/Pythia/test_20M/*.root
   max_num_particles: 128
   num_workers: 4
+  # Rows held in the streaming shuffle buffer per DataLoader worker. Each
+  # JetClass shard file is class-pure (HToBB_*.root etc.), so we mix this
+  # many rows across many files before yielding to guarantee class-diverse
+  # batches. 0 disables (eval). ~11 KB per row × buffer_size × workers.
+  shuffle_buffer_size: 20000
 
 model:
   input_dim: 17
@@ -32,10 +37,10 @@ train:
   batch_size: 256
   lr: 1.0e-3
   weight_decay: 1.0e-4
+  warmup_steps: 10000
   total_steps: 200000
   log_every: 50
   val_every: 2000
-  warmup_steps: 1000
   seed: 42
   use_amp: true
   grad_clip: 5.0

@@ -7,6 +7,9 @@ data:
   test_glob:  datasets/example/JetClass_example_100k_test.root
   max_num_particles: 128
   num_workers: 4
+  # See default.yaml for the rationale; example file is mixed-class so any
+  # value works, but 5000 is enough.
+  shuffle_buffer_size: 5000
 
 model:
   input_dim: 17

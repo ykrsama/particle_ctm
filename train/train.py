@@ -137,6 +137,7 @@ def train_worker(cfg):
     model.register_forward_pre_hook(clamp_decay_params)
 
     # Data — file-level sharding by rank.
+    shuffle_buf = cfg['data'].get('shuffle_buffer_size', 20000)
     train_loader = build_dataloader(
         cfg['data']['train_glob'],
         batch_size=cfg['train']['batch_size'],
@@ -144,6 +145,7 @@ def train_worker(cfg):
         max_num_particles=cfg['data']['max_num_particles'],
         shuffle=True,
         rank=rank, world_size=world, seed=cfg['train']['seed'],
+        shuffle_buffer_size=shuffle_buf,
     )
     val_loader = build_dataloader(
         cfg['data']['val_glob'],
@@ -268,6 +270,13 @@ def main():
     parser.add_argument('--config', default=os.path.join(_PROJ_ROOT, 'particle_ctm', 'configs', 'default.yaml'))
     parser.add_argument('--single-gpu', action='store_true',
                         help='Run train_worker directly (skip Ray). Useful for debugging.')
+    parser.add_argument('--final-test', action='store_true',
+                        help='After training, run particle_ctm.eval.test.run_test on '
+                             'the best checkpoint and write metrics + plots into '
+                             '<run_dir>/test.')
+    parser.add_argument('--final-test-only', action='store_true',
+                        help='Skip training; just run the final test using the '
+                             'existing best.pt for this config.')
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -308,8 +317,15 @@ def main():
         yaml.safe_dump({k: v for k, v in cfg.items() if not k.startswith('_')}, f)
     print(f'[output] run dir: {run_dir}', flush=True)
 
+    # --final-test-only short-circuits training.
+    if args.final_test_only:
+        _run_final_test(cfg)
+        return
+
     if args.single_gpu:
         train_worker(cfg)
+        if args.final_test:
+            _run_final_test(cfg)
         return
 
     import ray
@@ -350,6 +366,23 @@ def main():
     )
     result = trainer.fit()
     print('Ray run finished:', result)
+
+    if args.final_test:
+        _run_final_test(cfg)
+
+
+def _run_final_test(cfg):
+    """Invoke the standalone eval module on this run's best.pt."""
+    from particle_ctm.eval.test import run_test
+    run_dir = cfg['output']['run_dir']
+    ckpt_name = cfg['output'].get('ckpt_name', 'best.pt')
+    ckpt_path = os.path.join(run_dir, ckpt_name)
+    output_dir = os.path.join(run_dir, 'test')
+    if not os.path.isfile(ckpt_path):
+        print(f'[final-test] no checkpoint at {ckpt_path}, skipping.')
+        return
+    print(f'[final-test] running on {ckpt_path} → {output_dir}')
+    run_test(cfg, ckpt_path, output_dir)
 
 
 if __name__ == '__main__':
