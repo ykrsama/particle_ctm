@@ -221,12 +221,22 @@ def train_worker(cfg):
     model.train()
     iterator = iter(train_loader)
     t0 = time.time()
+    # Rolling stats for data-pipeline starvation diagnostics.
+    data_wait_ms_acc = 0.0
+    data_wait_ms_max = 0.0
+    data_wait_n = 0
     for step in range(total):
+        t_wait = time.time()
         try:
             x_feat, x_vec, mask, y = next(iterator)
         except StopIteration:
             iterator = iter(train_loader)
             x_feat, x_vec, mask, y = next(iterator)
+        data_wait_ms = (time.time() - t_wait) * 1000.0
+        data_wait_ms_acc += data_wait_ms
+        data_wait_ms_max = max(data_wait_ms_max, data_wait_ms)
+        data_wait_n += 1
+
         x_feat = x_feat.to(device, non_blocking=True)
         x_vec = x_vec.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -259,8 +269,14 @@ def train_worker(cfg):
         if rank == 0 and step % cfg['train']['log_every'] == 0:
             acc = calculate_accuracy(preds, y, where)
             ips = (step + 1) * cfg['train']['batch_size'] * world / max(time.time() - t0, 1e-6)
+            data_wait_avg = data_wait_ms_acc / max(1, data_wait_n)
+            data_wait_peak = data_wait_ms_max
+            data_wait_ms_acc = 0.0
+            data_wait_ms_max = 0.0
+            data_wait_n = 0
             print(f'step {step:6d} loss {loss.item():.4f} acc {acc:.4f} '
-                  f'lr {scheduler.get_last_lr()[0]:.2e} ips {ips:.0f}', flush=True)
+                  f'lr {scheduler.get_last_lr()[0]:.2e} ips {ips:.0f} '
+                  f'wait {data_wait_avg:.1f}/{data_wait_peak:.1f}ms', flush=True)
             if use_wandb:
                 # Class distribution of the current batch (sanity check that
                 # the shuffle buffer is producing diverse batches).
@@ -274,6 +290,13 @@ def train_worker(cfg):
                     'train/acc': float(acc),
                     'train/lr': scheduler.get_last_lr()[0],
                     'train/ips': ips,
+                    # Data-pipeline starvation: time spent blocked on the
+                    # DataLoader queue. <5 ms = healthy prefetch; persistent
+                    # >50 ms = workers can't keep up; periodic spikes = file-
+                    # load stalls (see slot-exhaustion discussion in
+                    # data/jetclass.py).
+                    'data/wait_ms_avg': data_wait_avg,
+                    'data/wait_ms_peak': data_wait_peak,
                     'train/true_label_dist':
                         _label_hist(true_now, mcfg['num_classes'], 'train true labels'),
                     'train/pred_label_dist':
