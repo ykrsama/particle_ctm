@@ -34,20 +34,18 @@ from particle_ctm.models.particle_ctm import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Label-distribution → wandb bar chart
 # ---------------------------------------------------------------------------
-def _label_hist(labels, num_classes, key_name, step=None):
+def _label_hist(labels, num_classes, key_name):
     """Build a wandb bar chart of label counts. Discrete classes → categorical
-    bars (so the eye can spot a single class dominating). The step is baked
-    into the chart title so the panel legend reads `step N` instead of the
-    run name."""
+    bars (so the eye can spot a single class dominating). Title is kept
+    constant across steps so the wandb panel auto-refreshes in place."""
     import numpy as _np
     import wandb as _wandb
     counts = _np.bincount(_np.asarray(labels, dtype='int64'),
                           minlength=num_classes).tolist()
     class_names = [lbl.replace('label_', '') for lbl in LABELS][:num_classes]
     data = [[name, c] for name, c in zip(class_names, counts)]
-    title = key_name if step is None else f'{key_name} @ step {step}'
     table = _wandb.Table(data=data, columns=['class', 'count'])
-    return _wandb.plot.bar(table, 'class', 'count', title=title)
+    return _wandb.plot.bar(table, 'class', 'count', title=key_name)
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +275,9 @@ def train_worker(cfg):
                     'train/lr': scheduler.get_last_lr()[0],
                     'train/ips': ips,
                     'train/true_label_dist':
-                        _label_hist(true_now, mcfg['num_classes'],
-                                    'train true labels', step=step),
+                        _label_hist(true_now, mcfg['num_classes'], 'train true labels'),
                     'train/pred_label_dist':
-                        _label_hist(pred_now, mcfg['num_classes'],
-                                    'train predicted labels', step=step),
+                        _label_hist(pred_now, mcfg['num_classes'], 'train predicted labels'),
                     'step': step,
                 })
 
@@ -300,11 +296,9 @@ def train_worker(cfg):
                     wandb.log({
                         'val/loss': val_loss, 'val/acc': val_acc,
                         'val/true_label_dist':
-                            _label_hist(val_true, mcfg['num_classes'],
-                                        'val true labels', step=step),
+                            _label_hist(val_true, mcfg['num_classes'], 'val true labels'),
                         'val/pred_label_dist':
-                            _label_hist(val_pred, mcfg['num_classes'],
-                                        'val predicted labels', step=step),
+                            _label_hist(val_pred, mcfg['num_classes'], 'val predicted labels'),
                         'step': step,
                     })
                 if val_acc > best_val_acc:

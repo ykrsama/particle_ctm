@@ -314,38 +314,59 @@ class JetClassIterableDataset(IterableDataset):
                 epoch += 1
                 continue
 
-            # ----- Train mode: K-slot concurrent reader + shuffle buffer -----
-            # Hold K = num_concurrent_files files open at once and random-draw
-            # rows from them so the buffer fills with class-diverse rows from
-            # the very first push. Memory: K × (~1.2 GB per JetClass file).
+            # ----- Train mode: stratified K-slot concurrent reader -----------
+            # Pick K files at a time, BUT assign one class per slot so the
+            # K-way mix is guaranteed to cover K distinct classes. Without
+            # stratification, sampling K files at random from a balanced pool
+            # of C classes gives only C*(1-(1-1/C)^K) unique classes (e.g.
+            # 6.5 / 10 with K=10), which is why a batch ends up with 6–7
+            # bars, not 10.
             rng = random.Random(self.seed + worker_id * 991 + epoch * 7919)
             files = list(files)
             rng.shuffle(files)
-            files_iter = iter(files)
 
-            def _new_slot():
-                """Pop files until one loads successfully; return slot or None.
-                Slot holds only `rows_per_file_visit` rows (subsampled + copied
-                out, parent file freed) to keep K-slot memory bounded.
-                """
-                while True:
-                    fp = next(files_iter, None)
-                    if fp is None:
-                        return None
-                    blk = self._load_block(fp, row_offset, row_stride, epoch,
-                                           max_rows=self.rows_per_file_visit)
-                    if blk is None:
-                        continue
-                    xf, xv, m, labels_idx, order = blk
-                    return {
-                        'xf': xf, 'xv': xv, 'm': m, 'labels': labels_idx,
-                        'order': order, 'cursor': 0, 'n': len(order),
-                    }
+            # Group files by class prefix (everything before the first '_'
+            # in the basename). JetClass files are HToBB_000.root etc.
+            class_files = {}
+            for fp in files:
+                base = os.path.basename(fp)
+                cls = base.split('_', 1)[0] if '_' in base else base
+                class_files.setdefault(cls, []).append(fp)
+            for cls in class_files:
+                rng.shuffle(class_files[cls])
+            classes = list(class_files.keys())
+            rng.shuffle(classes)
+            class_iters = {cls: iter(class_files[cls]) for cls in classes}
 
+            def _new_slot(target_cls):
+                """Load the next file from `target_cls`; fall back to any
+                other class with remaining files if exhausted. Returns
+                (slot_dict, class_used) or (None, None) when nothing left."""
+                # Try the target class first, then any other class with files.
+                lanes = [target_cls] + [c for c in classes if c != target_cls]
+                for cls in lanes:
+                    while True:
+                        fp = next(class_iters[cls], None)
+                        if fp is None:
+                            break
+                        blk = self._load_block(fp, row_offset, row_stride, epoch,
+                                               max_rows=self.rows_per_file_visit)
+                        if blk is None:
+                            continue
+                        xf, xv, m, labels_idx, order = blk
+                        return ({
+                            'xf': xf, 'xv': xv, 'm': m, 'labels': labels_idx,
+                            'order': order, 'cursor': 0, 'n': len(order),
+                            'cls': cls,
+                        }, cls)
+                return None, None
+
+            # Initial fill: one slot per class, round-robin (capped at K).
             K = min(self.num_concurrent_files, len(files))
             slots = []
-            for _ in range(K):
-                s = _new_slot()
+            for k in range(K):
+                target = classes[k % len(classes)]
+                s, _ = _new_slot(target)
                 if s is None:
                     break
                 slots.append(s)
@@ -366,7 +387,9 @@ class JetClassIterableDataset(IterableDataset):
                     buffer[k] = item
                     yield self._make_row_tensors(*out)
                 if s['cursor'] >= s['n']:
-                    repl = _new_slot()
+                    # Refill the slot — prefer the same class lane to keep
+                    # K classes resident at all times.
+                    repl, _ = _new_slot(s['cls'])
                     if repl is None:
                         slots.pop(j)
                     else:
