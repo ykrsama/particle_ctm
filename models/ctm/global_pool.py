@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 
 from .ctm_pool import _build_nlm, compute_sync_first_last
-from .nlm_readout import NLMReadout
 
 
 class GlobalCTMPool(nn.Module):
@@ -43,7 +42,7 @@ class GlobalCTMPool(nn.Module):
         self.side = side
         self.sync_size = (n_synch * (n_synch + 1)) // 2
 
-        self.pre_proj = NLMReadout(d_pool_in, n_neurons, dropout=dropout)
+        self.pre_proj = nn.Linear(d_pool_in, n_neurons)
         self.nlm = _build_nlm(memory_length, n_neurons, dropout)
 
         bound = math.sqrt(1.0 / (n_neurons + memory_length))
