@@ -34,7 +34,7 @@ train:
   weight_decay: 1.0e-4
   total_steps: 200000
   log_every: 50
-  test_every: 2000
+  val_every: 2000
   warmup_steps: 1000
   seed: 42
   use_amp: true

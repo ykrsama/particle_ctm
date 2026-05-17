@@ -13,10 +13,10 @@ model:
   num_classes: 10
   pair_input_dim: 4
   pair_extra_dim: 0
-  embed_dims: [128, 512, 128]
+  embed_dims: [256, 512, 256]
   pair_embed_dims: [64, 64, 64]
   use_pre_activation_pair: false
-  num_heads: 8
+  num_heads: 16
   iterations: 48
   memory_length: 16
   d_model_qkv: 128
@@ -32,10 +32,10 @@ train:
   batch_size: 64
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  warmup_steps: 20000
-  total_steps: 200000
+  warmup_steps: 10000
+  total_steps: 100000
   log_every: 50
-  test_every: 2000
+  val_every: 2000
   seed: 42
   use_amp: true
   grad_clip: 5.0

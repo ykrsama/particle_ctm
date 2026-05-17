@@ -222,7 +222,7 @@ def train_worker(cfg):
                     'step': step,
                 })
 
-        if step > 0 and step % cfg['train']['test_every'] == 0:
+        if step > 0 and step % cfg['train']['val_every'] == 0:
             val_loss, val_acc = evaluate(model, val_loader, device)
             # Reduce across workers for a fair number on rank 0.
             if world > 1:
