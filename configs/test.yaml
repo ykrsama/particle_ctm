@@ -17,9 +17,13 @@ model:
   num_classes: 10
   pair_input_dim: 4
   pair_extra_dim: 0
-  embed_dims: [256, 512, 256]
-  pair_embed_dims: [64, 64, 64]
-  use_pre_activation_pair: false
+  embed_dim: 256
+  d_model_embed: 256
+  n_synch_embed: 16
+  d_model_pair: 32
+  n_synch_pair: 8
+  d_model_head: 256
+  n_synch_head: 16
   num_heads: 16
   iterations: 48
   memory_length: 16
@@ -29,8 +33,6 @@ model:
   n_synch_o: 16
   dropout: 0.0
   trim: true
-  fc_params: []
-  activation: gelu
 
 train:
   batch_size: 64
