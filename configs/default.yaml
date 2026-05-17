@@ -1,0 +1,53 @@
+# Default config for ParticleCTM on JetClass.
+
+data:
+  # Adjust these globs once your downloads finish.
+  train_glob: ../particle_transformer/datasets/JetClass/train_100M/*.root
+  val_glob:   ../particle_transformer/datasets/JetClass/val_5M/*.root
+  test_glob:  ../particle_transformer/datasets/JetClass/test_20M/*.root
+  max_num_particles: 128
+  num_workers: 4
+
+model:
+  input_dim: 17
+  num_classes: 10
+  pair_input_dim: 4
+  pair_extra_dim: 0
+  embed_dims: [128, 512, 128]
+  pair_embed_dims: [64, 64, 64]
+  use_pre_activation_pair: false
+  num_heads: 8
+  iterations: 8
+  memory_length: 10
+  d_model_qkv: 128
+  d_model_o: 128
+  n_synch_qkv: 32
+  n_synch_o: 32
+  dropout: 0.0
+  trim: true
+  fc_params: []
+  activation: gelu
+
+train:
+  batch_size: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  total_steps: 200000
+  log_every: 50
+  test_every: 2000
+  warmup_steps: 1000
+  seed: 42
+  use_amp: true
+  grad_clip: 5.0
+
+ray:
+  num_workers: 4         # number of GPUs
+  use_gpu: true
+  resources_per_worker:
+    CPU: 8
+    GPU: 1
+
+wandb:
+  project: particle-ctm-jetclass
+  entity: null
+  mode: online           # online | offline | disabled
