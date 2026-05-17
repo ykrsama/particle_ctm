@@ -12,6 +12,16 @@ data:
   # many rows across many files before yielding to guarantee class-diverse
   # batches. 0 disables (eval). ~11 KB per row × buffer_size × workers.
   shuffle_buffer_size: 20000
+  # ROOT files held open at once per worker. PyTorch's IterableDataset
+  # guarantees each batch comes from ONE worker, so K must be ≥ num_classes
+  # if you want every batch to contain all classes. JetClass has 10 classes.
+  num_concurrent_files: 10
+  # Per-file row cap. Each slot holds only this many rows (subsampled, copied
+  # out, parent freed). Required when K is large: K=10 with full files would
+  # use ~11 GB per worker × 16 workers = 176 GB. With 10000 rows per visit,
+  # slot footprint drops to ~110 MB × K × workers ≈ 18 GB total. Set to null
+  # for full-file coverage per visit if you have the RAM.
+  rows_per_file_visit: 10000
 
 model:
   input_dim: 17

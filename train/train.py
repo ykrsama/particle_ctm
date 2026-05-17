@@ -23,22 +23,48 @@ _PROJ_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..'))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
-from particle_ctm.data.jetclass import build_dataloader, NUM_FEATURES, NUM_CLASSES  # noqa: E402
+from particle_ctm.data.jetclass import (  # noqa: E402
+    LABELS, build_dataloader, NUM_FEATURES, NUM_CLASSES,
+)
 from particle_ctm.models.particle_ctm import (  # noqa: E402
     ParticleCTM, get_loss, calculate_accuracy,
 )
 
 
 # ---------------------------------------------------------------------------
+# Label-distribution → wandb bar chart
+# ---------------------------------------------------------------------------
+def _label_hist(labels, num_classes, key_name, step=None):
+    """Build a wandb bar chart of label counts. Discrete classes → categorical
+    bars (so the eye can spot a single class dominating). The step is baked
+    into the chart title so the panel legend reads `step N` instead of the
+    run name."""
+    import numpy as _np
+    import wandb as _wandb
+    counts = _np.bincount(_np.asarray(labels, dtype='int64'),
+                          minlength=num_classes).tolist()
+    class_names = [lbl.replace('label_', '') for lbl in LABELS][:num_classes]
+    data = [[name, c] for name, c in zip(class_names, counts)]
+    title = key_name if step is None else f'{key_name} @ step {step}'
+    table = _wandb.Table(data=data, columns=['class', 'count'])
+    return _wandb.plot.bar(table, 'class', 'count', title=title)
+
+
+# ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
 def evaluate(model, loader, device, max_batches=200):
-    """Iterable val loader → fixed number of batches per eval pass."""
+    """Iterable val loader → fixed number of batches per eval pass.
+
+    Returns (loss, acc, true_labels, pred_labels) where the last two are 1D
+    numpy arrays for distribution diagnostics.
+    """
     model.eval()
     total_loss = 0.0
     correct = 0
     seen = 0
     n_batches = 0
+    true_lbls, pred_lbls = [], []
     with torch.inference_mode():
         for x_feat, x_vec, mask, y in loader:
             x_feat = x_feat.to(device, non_blocking=True)
@@ -52,10 +78,22 @@ def evaluate(model, loader, device, max_batches=200):
             correct += acc * y.size(0)
             seen += y.size(0)
             n_batches += 1
+            # Capture per-sample predicted class at the most-certain tick.
+            B = preds.size(0)
+            bi = torch.arange(B, device=preds.device)
+            pred_idx = preds.argmax(dim=1)[bi, where]
+            true_lbls.append(y.detach().cpu().numpy())
+            pred_lbls.append(pred_idx.detach().cpu().numpy())
             if n_batches >= max_batches:
                 break
     model.train()
-    return total_loss / max(n_batches, 1), correct / max(seen, 1)
+    import numpy as _np
+    return (
+        total_loss / max(n_batches, 1),
+        correct / max(seen, 1),
+        _np.concatenate(true_lbls) if true_lbls else _np.zeros(0, dtype='int64'),
+        _np.concatenate(pred_lbls) if pred_lbls else _np.zeros(0, dtype='int64'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +176,8 @@ def train_worker(cfg):
 
     # Data — file-level sharding by rank.
     shuffle_buf = cfg['data'].get('shuffle_buffer_size', 20000)
+    num_concurrent = cfg['data'].get('num_concurrent_files', 10)
+    rows_per_visit = cfg['data'].get('rows_per_file_visit', 10000)
     train_loader = build_dataloader(
         cfg['data']['train_glob'],
         batch_size=cfg['train']['batch_size'],
@@ -146,6 +186,8 @@ def train_worker(cfg):
         shuffle=True,
         rank=rank, world_size=world, seed=cfg['train']['seed'],
         shuffle_buffer_size=shuffle_buf,
+        num_concurrent_files=num_concurrent,
+        rows_per_file_visit=rows_per_visit,
     )
     val_loader = build_dataloader(
         cfg['data']['val_glob'],
@@ -200,15 +242,21 @@ def train_worker(cfg):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip'])
+            # Only advance the scheduler when the GradScaler actually stepped
+            # the optimiser (otherwise PyTorch warns about scheduler stepping
+            # before optimiser).
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()
         else:
             preds, certs = model(x_feat, v=x_vec, mask=mask)
             loss, where = get_loss(preds, certs, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip'])
             optimizer.step()
-        scheduler.step()
+            scheduler.step()
 
         if rank == 0 and step % cfg['train']['log_every'] == 0:
             acc = calculate_accuracy(preds, y, where)
@@ -216,16 +264,29 @@ def train_worker(cfg):
             print(f'step {step:6d} loss {loss.item():.4f} acc {acc:.4f} '
                   f'lr {scheduler.get_last_lr()[0]:.2e} ips {ips:.0f}', flush=True)
             if use_wandb:
+                # Class distribution of the current batch (sanity check that
+                # the shuffle buffer is producing diverse batches).
+                B = preds.size(0)
+                bi = torch.arange(B, device=preds.device)
+                pred_idx_now = preds.argmax(dim=1)[bi, where]
+                true_now = y.detach().cpu().numpy()
+                pred_now = pred_idx_now.detach().cpu().numpy()
                 wandb.log({
                     'train/loss': loss.item(),
                     'train/acc': float(acc),
                     'train/lr': scheduler.get_last_lr()[0],
                     'train/ips': ips,
+                    'train/true_label_dist':
+                        _label_hist(true_now, mcfg['num_classes'],
+                                    'train true labels', step=step),
+                    'train/pred_label_dist':
+                        _label_hist(pred_now, mcfg['num_classes'],
+                                    'train predicted labels', step=step),
                     'step': step,
                 })
 
         if step > 0 and step % cfg['train']['val_every'] == 0:
-            val_loss, val_acc = evaluate(model, val_loader, device)
+            val_loss, val_acc, val_true, val_pred = evaluate(model, val_loader, device)
             # Reduce across workers for a fair number on rank 0.
             if world > 1:
                 t = torch.tensor([val_loss, val_acc, 1.0], device=device)
@@ -236,7 +297,16 @@ def train_worker(cfg):
                 print(f'[val @ {step}] loss {val_loss:.4f} acc {val_acc:.4f} '
                       f'best {best_val_acc:.4f}', flush=True)
                 if use_wandb:
-                    wandb.log({'val/loss': val_loss, 'val/acc': val_acc, 'step': step})
+                    wandb.log({
+                        'val/loss': val_loss, 'val/acc': val_acc,
+                        'val/true_label_dist':
+                            _label_hist(val_true, mcfg['num_classes'],
+                                        'val true labels', step=step),
+                        'val/pred_label_dist':
+                            _label_hist(val_pred, mcfg['num_classes'],
+                                        'val predicted labels', step=step),
+                        'step': step,
+                    })
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save({

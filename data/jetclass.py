@@ -181,13 +181,25 @@ class JetClassIterableDataset(IterableDataset):
                  seed=42,
                  rank=0,
                  world_size=1,
-                 shuffle_buffer_size=20000):
+                 shuffle_buffer_size=20000,
+                 num_concurrent_files=10,
+                 rows_per_file_visit=10000):
         """
-        shuffle_buffer_size: when shuffle is on, rows from many files are mixed
-            in a buffer of this many rows before being yielded. Required for
-            JetClass because each ROOT file is class-pure (HToBB_*.root, etc.);
-            without inter-file mixing a single DataLoader batch contains only
-            one class. 0 disables the buffer.
+        shuffle_buffer_size: rows held in the streaming shuffle buffer per
+            worker. 0 disables shuffling entirely (eval mode).
+        num_concurrent_files: open this many ROOT files at once and round-robin
+            random-draw rows from them. Critical for JetClass because each
+            file is class-pure (HToBB_*.root etc.); EVERY batch comes from a
+            single DataLoader worker (PyTorch IterableDataset behaviour), so
+            K must be ≥ num_classes if you want every batch to contain all
+            classes. Default 10 matches JetClass's 10 classes.
+        rows_per_file_visit: when a file is opened, only this many random rows
+            are extracted and held in the slot; the parent ndarray is freed
+            immediately. Required at K=10 to keep memory reasonable: with
+            K=10 and full files, each worker holds K × 1.1 GB ≈ 11 GB and
+            16 workers (4 ranks × 4 DataLoader workers) sum to ~176 GB. With
+            rows_per_file_visit=10000 the slot holds 10k × 11 KB ≈ 110 MB →
+            ~18 GB total. Set to None for full coverage per visit (heavy).
         """
         super().__init__()
         files = sorted(glob.glob(file_glob))
@@ -201,6 +213,8 @@ class JetClassIterableDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.num_concurrent_files = max(1, num_concurrent_files)
+        self.rows_per_file_visit = rows_per_file_visit
 
     def _shard_files(self, rank, world, worker_id, num_workers, epoch):
         """Return (files_for_this_shard, row_stride, row_offset).
@@ -224,9 +238,12 @@ class JetClassIterableDataset(IterableDataset):
         # Few-file regime — replicate file list, slice rows instead.
         return files, total_shards, shard_idx
 
-    def _load_block(self, fp, row_offset, row_stride, epoch):
-        """Load a ROOT file and return per-row arrays after row striding +
-        optional within-file shuffle. Returns None on read failure.
+    def _load_block(self, fp, row_offset, row_stride, epoch, max_rows=None):
+        """Load a ROOT file, apply row striding/shuffle, optionally subsample
+        to `max_rows`, copy the slice out, free the source arrays.
+
+        Returns (xf, xv, m, labels, order) where order indexes into xf/xv/m/
+        labels (which are already the subsample). Returns None on read failure.
         """
         try:
             x_part, x_jet, y = _read_root(
@@ -247,7 +264,15 @@ class JetClassIterableDataset(IterableDataset):
             rng = np.random.default_rng(self.seed + epoch * 7919 + (hash(fp) & 0x7fffffff))
             rng.shuffle(order)
         order = order[row_offset::row_stride]
-        return xf, xv, m, labels_idx, order
+        if max_rows is not None and len(order) > max_rows:
+            order = order[:max_rows]
+        # Extract only what we'll use and free the parent ndarrays.
+        xf_sub = xf[order].copy()
+        xv_sub = xv[order].copy()
+        m_sub = m[order].copy()
+        labels_sub = labels_idx[order].copy()
+        del xf, xv, m, labels_idx, x_part, x_jet, y
+        return xf_sub, xv_sub, m_sub, labels_sub, np.arange(len(order))
 
     @staticmethod
     def _make_row_tensors(xf_row, xv_row, m_row, label):
@@ -275,7 +300,10 @@ class JetClassIterableDataset(IterableDataset):
             # ----- Eval / no-shuffle mode: yield rows in file order ----------
             if buf_size == 0:
                 for fp in files:
-                    blk = self._load_block(fp, row_offset, row_stride, epoch)
+                    # Eval: read full file (no subsample) for deterministic
+                    # coverage of every test/val row.
+                    blk = self._load_block(fp, row_offset, row_stride, epoch,
+                                            max_rows=None)
                     if blk is None:
                         continue
                     xf, xv, m, labels_idx, order = blk
@@ -286,27 +314,63 @@ class JetClassIterableDataset(IterableDataset):
                 epoch += 1
                 continue
 
-            # ----- Train mode: streaming shuffle buffer ----------------------
-            # Buffer holds tuples (xf_row.copy(), xv_row.copy(), m_row.copy(),
-            # label). We copy rows because the parent ndarrays for previous
-            # files would otherwise stay alive as long as any slice references
-            # them, blowing memory once we move on.
+            # ----- Train mode: K-slot concurrent reader + shuffle buffer -----
+            # Hold K = num_concurrent_files files open at once and random-draw
+            # rows from them so the buffer fills with class-diverse rows from
+            # the very first push. Memory: K × (~1.2 GB per JetClass file).
             rng = random.Random(self.seed + worker_id * 991 + epoch * 7919)
+            files = list(files)
+            rng.shuffle(files)
+            files_iter = iter(files)
+
+            def _new_slot():
+                """Pop files until one loads successfully; return slot or None.
+                Slot holds only `rows_per_file_visit` rows (subsampled + copied
+                out, parent file freed) to keep K-slot memory bounded.
+                """
+                while True:
+                    fp = next(files_iter, None)
+                    if fp is None:
+                        return None
+                    blk = self._load_block(fp, row_offset, row_stride, epoch,
+                                           max_rows=self.rows_per_file_visit)
+                    if blk is None:
+                        continue
+                    xf, xv, m, labels_idx, order = blk
+                    return {
+                        'xf': xf, 'xv': xv, 'm': m, 'labels': labels_idx,
+                        'order': order, 'cursor': 0, 'n': len(order),
+                    }
+
+            K = min(self.num_concurrent_files, len(files))
+            slots = []
+            for _ in range(K):
+                s = _new_slot()
+                if s is None:
+                    break
+                slots.append(s)
+
             buffer = []
-            for fp in files:
-                blk = self._load_block(fp, row_offset, row_stride, epoch)
-                if blk is None:
-                    continue
-                xf, xv, m, labels_idx, order = blk
-                for i in order:
-                    item = (xf[i].copy(), xv[i].copy(), m[i].copy(), int(labels_idx[i]))
-                    if len(buffer) < buf_size:
-                        buffer.append(item)
+            while slots:
+                j = rng.randrange(len(slots))
+                s = slots[j]
+                i = int(s['order'][s['cursor']])
+                s['cursor'] += 1
+                item = (s['xf'][i].copy(), s['xv'][i].copy(),
+                        s['m'][i].copy(), int(s['labels'][i]))
+                if len(buffer) < buf_size:
+                    buffer.append(item)
+                else:
+                    k = rng.randrange(buf_size)
+                    out = buffer[k]
+                    buffer[k] = item
+                    yield self._make_row_tensors(*out)
+                if s['cursor'] >= s['n']:
+                    repl = _new_slot()
+                    if repl is None:
+                        slots.pop(j)
                     else:
-                        j = rng.randrange(buf_size)
-                        out = buffer[j]
-                        buffer[j] = item
-                        yield self._make_row_tensors(*out)
+                        slots[j] = repl
             # Drain remaining buffer in random order.
             rng.shuffle(buffer)
             for out in buffer:
@@ -317,7 +381,9 @@ class JetClassIterableDataset(IterableDataset):
 def build_dataloader(file_glob, batch_size, num_workers=4,
                      max_num_particles=128, shuffle=True,
                      rank=0, world_size=1, seed=42,
-                     shuffle_buffer_size=20000):
+                     shuffle_buffer_size=20000,
+                     num_concurrent_files=10,
+                     rows_per_file_visit=10000):
     ds = JetClassIterableDataset(
         file_glob,
         max_num_particles=max_num_particles,
@@ -327,6 +393,8 @@ def build_dataloader(file_glob, batch_size, num_workers=4,
         world_size=world_size,
         seed=seed,
         shuffle_buffer_size=shuffle_buffer_size if shuffle else 0,
+        num_concurrent_files=num_concurrent_files,
+        rows_per_file_visit=rows_per_file_visit,
     )
     return torch.utils.data.DataLoader(
         ds, batch_size=batch_size, num_workers=num_workers,
