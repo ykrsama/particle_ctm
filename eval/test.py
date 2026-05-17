@@ -55,7 +55,7 @@ from particle_ctm.data.jetclass import (  # noqa: E402
     build_dataloader,
 )
 from particle_ctm.models.particle_ctm import (  # noqa: E402
-    ParticleCTM, calculate_accuracy, get_loss, summarize_parameters,
+    ParticleCTM, calculate_accuracy, get_loss,
 )
 
 
@@ -73,15 +73,22 @@ def build_model_from_cfg(cfg, device):
         pair_input_dim=mcfg['pair_input_dim'],
         pair_extra_dim=mcfg['pair_extra_dim'],
         embed_dim=mcfg['embed_dim'],
+        d_model_embed=mcfg['d_model_embed'],
+        n_synch_embed=mcfg['n_synch_embed'],
+        d_model_pair=mcfg['d_model_pair'],
+        n_synch_pair=mcfg['n_synch_pair'],
+        d_model_head=mcfg['d_model_head'],
+        n_synch_head=mcfg['n_synch_head'],
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
-        n_global=mcfg['n_global'],
-        n_synch_global=mcfg['n_synch_global'],
         memory_length=mcfg['memory_length'],
+        d_model_qkv=mcfg['d_model_qkv'],
+        d_model_o=mcfg['d_model_o'],
+        n_synch_qkv=mcfg['n_synch_qkv'],
+        n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
         trim=mcfg['trim'],
     ).to(device)
-    print(summarize_parameters(model))
     return model
 
 

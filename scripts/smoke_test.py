@@ -14,9 +14,7 @@ _PROJ_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..'))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
-from particle_ctm.models.particle_ctm import (
-    ParticleCTM, get_loss, calculate_accuracy, summarize_parameters,
-)
+from particle_ctm.models.particle_ctm import ParticleCTM, get_loss, calculate_accuracy
 
 
 def main():
@@ -36,14 +34,22 @@ def main():
     model = ParticleCTM(
         input_dim=C, num_classes=10,
         embed_dim=64,
+        d_model_embed=64,
+        n_synch_embed=8,
+        d_model_pair=16,
+        n_synch_pair=4,
+        d_model_head=64,
+        n_synch_head=8,
         num_heads=4,
         iterations=3,
-        n_global=64,
-        n_synch_global=8,
         memory_length=4,
+        d_model_qkv=32,
+        d_model_o=32,
+        n_synch_qkv=8,
+        n_synch_o=8,
         trim=False,
     ).to(device)
-    print(summarize_parameters(model))
+    print(f'params: {sum(p.numel() for p in model.parameters()):,}')
 
     preds, certs = model(x_feat, v=x_vec, mask=mask)
     loss, where = get_loss(preds, certs, y)
