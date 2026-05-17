@@ -17,8 +17,8 @@ model:
   pair_embed_dims: [64, 64, 64]
   use_pre_activation_pair: false
   num_heads: 8
-  iterations: 50
-  memory_length: 15
+  iterations: 48
+  memory_length: 16
   d_model_qkv: 128
   d_model_o: 128
   n_synch_qkv: 16
@@ -30,12 +30,12 @@ model:
 
 train:
   batch_size: 64
-  lr: 1.0e-3
+  lr: 1.0e-4
   weight_decay: 1.0e-4
+  warmup_steps: 20000
   total_steps: 200000
   log_every: 50
   test_every: 2000
-  warmup_steps: 1000
   seed: 42
   use_amp: true
   grad_clip: 5.0
@@ -51,3 +51,12 @@ wandb:
   project: particle-ctm-jetclass-test
   entity: null
   mode: online           # online | offline | disabled
+
+output:
+  # Where checkpoints, wandb run files, and a config snapshot are written.
+  # Relative paths are resolved against the directory containing this yaml.
+  dir: runs
+  # Optional fixed run name. If null, a timestamp-based name is generated.
+  run_name: null
+  ckpt_name: best.pt
+  save_last: true        # also write last.pt at end-of-training

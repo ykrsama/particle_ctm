@@ -84,16 +84,22 @@ def train_worker(cfg):
 
     torch.manual_seed(cfg['train']['seed'] + rank)
 
-    # wandb on rank 0
+    # Output paths — main() has already resolved + created run_dir.
+    out_cfg = cfg.get('output', {})
+    run_dir = out_cfg.get('run_dir') or os.getcwd()
+    os.makedirs(run_dir, exist_ok=True)
+    run_name = out_cfg.get('run_name') or os.path.basename(run_dir)
+
+    # wandb on rank 0; its local files go inside the run dir.
     use_wandb = rank == 0 and cfg['wandb']['mode'] != 'disabled'
     if use_wandb:
-        run_name = f"particle-ctm-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         wandb.init(
             project=cfg['wandb']['project'],
             entity=cfg['wandb']['entity'],
             mode=cfg['wandb']['mode'],
             name=run_name,
-            config=cfg,
+            config={k: v for k, v in cfg.items() if not k.startswith('_')},
+            dir=run_dir,
         )
 
     # Model
@@ -167,9 +173,8 @@ def train_worker(cfg):
     scaler = torch.amp.GradScaler('cuda') if cfg['train']['use_amp'] else None
 
     best_val_acc = -float('inf')
-    ckpt_dir = os.path.join(_PROJ_ROOT, 'particle_ctm', 'ckpts')
-    os.makedirs(ckpt_dir, exist_ok=True)
-    best_ckpt = os.path.join(ckpt_dir, 'best.pt')
+    best_ckpt = os.path.join(run_dir, out_cfg.get('ckpt_name', 'best.pt'))
+    last_ckpt = os.path.join(run_dir, 'last.pt')
 
     model.train()
     iterator = iter(train_loader)
@@ -242,6 +247,15 @@ def train_worker(cfg):
                         wandb.run.summary['best_val_acc'] = best_val_acc
                         wandb.run.summary['best_step'] = step
 
+    # Optionally save the final weights too (regardless of best-acc tracking).
+    if rank == 0 and out_cfg.get('save_last', True):
+        torch.save({
+            'model_state_dict': base_model.state_dict(),
+            'config': cfg,
+            'step': cfg['train']['total_steps'],
+            'val_acc': best_val_acc,
+        }, last_ckpt)
+
     if rank == 0 and use_wandb:
         wandb.finish()
 
@@ -274,6 +288,26 @@ def main():
         if g and not os.path.isabs(g):
             cfg['data'][key] = os.path.abspath(os.path.join(cfg_dir, '..', g))
 
+    # Resolve output dir and freeze the run name now so every Ray worker (and
+    # any subsequent restart) writes into the same directory.
+    out_cfg = cfg.setdefault('output', {})
+    out_dir = out_cfg.get('dir', 'runs')
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.abspath(os.path.join(cfg_dir, '..', out_dir))
+    run_name = out_cfg.get('run_name') or \
+        f"particle-ctm-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_dir = os.path.join(out_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    cfg['output']['dir'] = out_dir
+    cfg['output']['run_name'] = run_name
+    cfg['output']['run_dir'] = run_dir
+    cfg['output'].setdefault('ckpt_name', 'best.pt')
+    cfg['output'].setdefault('save_last', True)
+    # Snapshot the resolved config next to the checkpoints.
+    with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
+        yaml.safe_dump({k: v for k, v in cfg.items() if not k.startswith('_')}, f)
+    print(f'[output] run dir: {run_dir}', flush=True)
+
     if args.single_gpu:
         train_worker(cfg)
         return
@@ -293,7 +327,7 @@ def main():
         pkg_src,
         os.path.join(stage, 'particle_ctm'),
         ignore=shutil.ignore_patterns(
-            'datasets', 'ckpts', '__pycache__', '*.pyc', '*.root',
+            'datasets', 'ckpts', 'runs', '__pycache__', '*.pyc', '*.root',
         ),
     )
     print(f'[ray] staged source at {stage}', flush=True)
