@@ -7,9 +7,6 @@ tensors per jet:
     x_features : (C_feat, P)  17 standardised particle features
     x_vectors  : (4, P)        (px, py, pz, energy) — fed to PairEmbed
     x_mask     : (1, P)        1 = real particle, 0 = padding
-
-We avoid weaver-core entirely so its numpy<2 pin doesn't conflict with the
-CTM stack.
 """
 
 import glob
@@ -18,15 +15,52 @@ import os
 import random
 import sys
 
+import awkward as ak
 import numpy as np
 import torch
+import uproot
+import vector
 from torch.utils.data import IterableDataset
 
-# Import particle_transformer/dataloader.read_file without touching weaver.
-_PT_REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'particle_transformer'))
-if _PT_REPO not in sys.path:
-    sys.path.insert(0, _PT_REPO)
-from dataloader import read_file as _read_root  # noqa: E402
+vector.register_awkward()
+
+
+# ---------------------------------------------------------------------------
+# read_file: inlined from particle_transformer/dataloader.py so this project is
+# self-contained (no sibling-tree dependency at runtime — important for Ray's
+# working_dir which can't ship the 240 GB particle_transformer/ tree).
+# ---------------------------------------------------------------------------
+def _read_root(filepath, max_num_particles=128, particle_features=None,
+               jet_features=None, labels=None):
+    def _pad(a, maxlen, value=0, dtype='float32'):
+        if isinstance(a, np.ndarray) and a.ndim >= 2 and a.shape[1] == maxlen:
+            return a
+        if isinstance(a, ak.Array):
+            if a.ndim == 1:
+                a = ak.unflatten(a, 1)
+            a = ak.fill_none(ak.pad_none(a, maxlen, clip=True), value)
+            return ak.values_astype(a, dtype)
+        x = (np.ones((len(a), maxlen)) * value).astype(dtype)
+        for idx, s in enumerate(a):
+            if not len(s):
+                continue
+            trunc = s[:maxlen].astype(dtype)
+            x[idx, :len(trunc)] = trunc
+        return x
+
+    table = uproot.open(filepath)['tree'].arrays()
+    p4 = vector.zip({'px': table['part_px'], 'py': table['part_py'],
+                     'pz': table['part_pz'], 'energy': table['part_energy']})
+    table['part_pt'] = p4.pt
+    table['part_eta'] = p4.eta
+    table['part_phi'] = p4.phi
+
+    x_part = np.stack([ak.to_numpy(_pad(table[n], maxlen=max_num_particles))
+                       for n in particle_features], axis=1)
+    x_jet = np.stack([ak.to_numpy(table[n]).astype('float32')
+                      for n in jet_features], axis=1)
+    y = np.stack([ak.to_numpy(table[n]).astype('int') for n in labels], axis=1)
+    return x_part, x_jet, y
 
 
 # ---------------------------------------------------------------------------
@@ -160,22 +194,37 @@ class JetClassIterableDataset(IterableDataset):
         self.world_size = world_size
 
     def _shard_files(self, rank, world, worker_id, num_workers, epoch):
+        """Return (files_for_this_shard, row_stride, row_offset).
+
+        Two regimes:
+          - len(files) >= total_shards: file-level sharding, every shard reads
+            a disjoint set of files; row_stride=1 row_offset=0.
+          - len(files) <  total_shards: every shard reads every file but takes
+            rows at [offset::stride] so total_shards parallel streams cover
+            all rows exactly once each pass.
+        """
         rng = random.Random(self.seed + epoch)
         files = list(self.files)
         if self.shuffle_files:
             rng.shuffle(files)
         total_shards = world * num_workers
         shard_idx = rank * num_workers + worker_id
-        return files[shard_idx::total_shards]
+
+        if len(files) >= total_shards:
+            return files[shard_idx::total_shards], 1, 0
+        # Few-file regime — replicate file list, slice rows instead.
+        return files, total_shards, shard_idx
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info is not None else 0
         num_workers = info.num_workers if info is not None else 1
-        # epoch-ish counter: workers reshuffle each pass.
         epoch = 0
         while True:
-            files = self._shard_files(self.rank, self.world_size, worker_id, num_workers, epoch)
+            files, row_stride, row_offset = self._shard_files(
+                self.rank, self.world_size, worker_id, num_workers, epoch)
+            if not files:  # guard against empty shards — never spin forever
+                return
             for fp in files:
                 try:
                     x_part, x_jet, y = _read_root(
@@ -195,6 +244,8 @@ class JetClassIterableDataset(IterableDataset):
                 if self.shuffle_within_file:
                     rng = np.random.default_rng(self.seed + epoch * 7919 + hash(fp) % (2**31))
                     rng.shuffle(order)
+                # In few-file regime each shard takes a strided slice of rows.
+                order = order[row_offset::row_stride]
 
                 for i in order:
                     yield (

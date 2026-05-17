@@ -2,9 +2,9 @@
 
 data:
   # Adjust these globs once your downloads finish.
-  train_glob: datasets/JetClass/train_100M/*.root
-  val_glob:   datasets/JetClass/val_5M/*.root
-  test_glob:  datasets/JetClass/test_20M/*.root
+  train_glob: datasets/example/JetClass_example_100k.root
+  val_glob:   datasets/example/JetClass_example_100k_val.root
+  test_glob:  datasets/example/JetClass_example_100k_test.root
   max_num_particles: 128
   num_workers: 4
 
@@ -29,7 +29,7 @@ model:
   activation: gelu
 
 train:
-  batch_size: 256
+  batch_size: 64
   lr: 1.0e-3
   weight_decay: 1.0e-4
   total_steps: 200000
@@ -48,6 +48,6 @@ ray:
     GPU: 1
 
 wandb:
-  project: particle-ctm-jetclass
+  project: particle-ctm-jetclass-test
   entity: null
   mode: online           # online | offline | disabled

@@ -62,9 +62,21 @@ def evaluate(model, loader, device, max_batches=200):
 # Per-worker training function (called by ray.train.torch.TorchTrainer)
 # ---------------------------------------------------------------------------
 def train_worker(cfg):
+    # Ray workers don't inherit the driver's sys.path. Re-inject the project
+    # root (stored in cfg by main()) and re-import package modules locally.
+    import sys as _sys
+    proj_root = cfg.get('_proj_root')
+    if proj_root and proj_root not in _sys.path:
+        _sys.path.insert(0, proj_root)
+
     import ray.train
     import ray.train.torch
     import wandb
+
+    from particle_ctm.data.jetclass import build_dataloader
+    from particle_ctm.models.particle_ctm import (
+        ParticleCTM, get_loss, calculate_accuracy,
+    )
 
     rank = ray.train.get_context().get_world_rank()
     world = ray.train.get_context().get_world_size()
@@ -250,6 +262,17 @@ def main():
     # Sanity-defaults from data module.
     cfg['model']['input_dim'] = cfg['model'].get('input_dim', NUM_FEATURES)
     cfg['model']['num_classes'] = cfg['model'].get('num_classes', NUM_CLASSES)
+    # Pass the project root to train_worker so each Ray worker can put it on
+    # sys.path before importing the `particle_ctm` package.
+    cfg['_proj_root'] = _PROJ_ROOT
+
+    # Resolve relative data globs against the config's directory so Ray workers
+    # (which run in a staged tmp cwd) still find the ROOT files on the shared FS.
+    cfg_dir = os.path.dirname(os.path.abspath(args.config))
+    for key in ('train_glob', 'val_glob', 'test_glob'):
+        g = cfg['data'].get(key)
+        if g and not os.path.isabs(g):
+            cfg['data'][key] = os.path.abspath(os.path.join(cfg_dir, '..', g))
 
     if args.single_gpu:
         train_worker(cfg)
@@ -259,7 +282,29 @@ def main():
     from ray.train.torch import TorchTrainer
     from ray.train import ScalingConfig
 
-    ray.init(ignore_reinit_error=True)
+    # Stage just the source into a temp dir as `<tmp>/particle_ctm/` and ship
+    # that as Ray's working_dir. Keeps the upload to a few MB and avoids
+    # walking the 240 GB particle_transformer tree.
+    import shutil
+    import tempfile
+    stage = tempfile.mkdtemp(prefix='particle_ctm_ray_')
+    pkg_src = os.path.join(_PROJ_ROOT, 'particle_ctm')
+    shutil.copytree(
+        pkg_src,
+        os.path.join(stage, 'particle_ctm'),
+        ignore=shutil.ignore_patterns(
+            'datasets', 'ckpts', '__pycache__', '*.pyc', '*.root',
+        ),
+    )
+    print(f'[ray] staged source at {stage}', flush=True)
+
+    ray.init(
+        ignore_reinit_error=True,
+        runtime_env={'working_dir': stage},
+        include_dashboard=True,
+        dashboard_host='0.0.0.0',
+        dashboard_port=8265,
+    )
     trainer = TorchTrainer(
         train_loop_per_worker=train_worker,
         train_loop_config=cfg,
