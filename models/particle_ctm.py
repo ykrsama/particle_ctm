@@ -99,10 +99,6 @@ class ParticleCTM(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         trunc_normal_(self.cls_token, std=0.02)
 
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'cls_token'}
-
     def _build_attn_bias(self, v, mask, P):
         """pair_embed(v) → (B, num_heads, P, P); pad with zero cls row/col.
 
