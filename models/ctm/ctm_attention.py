@@ -134,6 +134,28 @@ class CTMAttention(nn.Module):
         self.v_from_sync = nn.Linear(self.sync_size_qkv, embed_dim)
         self.o_from_sync = nn.Linear(self.sync_size_o, embed_dim)
 
+        # attn_out -> O-pool sync injection (zero-init: starts as a no-op)
+        self.attn_to_sync_o = nn.Linear(embed_dim, n_synch_o)
+        nn.init.zeros_(self.attn_to_sync_o.weight)
+        nn.init.zeros_(self.attn_to_sync_o.bias)
+
+        # Feedback from previous tick's attn_out into Q/K/V (zero-init no-ops)
+        # A: residual into the query/key/value inputs
+        self.prev_to_q = nn.Linear(embed_dim, embed_dim)
+        self.prev_to_k = nn.Linear(embed_dim, embed_dim)
+        self.prev_to_v = nn.Linear(embed_dim, embed_dim)
+        # B: injection into the first n_synch_qkv slots of activated
+        self.prev_to_sync_q = nn.Linear(embed_dim, n_synch_qkv)
+        self.prev_to_sync_k = nn.Linear(embed_dim, n_synch_qkv)
+        self.prev_to_sync_v = nn.Linear(embed_dim, n_synch_qkv)
+        for m in (self.prev_to_q, self.prev_to_k, self.prev_to_v,
+                  self.prev_to_sync_q, self.prev_to_sync_k, self.prev_to_sync_v):
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+        # residual LayerNorm applied to (sync-projected out) + attn_out
+        self.out_norm = nn.LayerNorm(embed_dim)
+
         # Learnable initial traces, per pool: (N_pool, memory_length)
         self._register_start_trace('q', d_model_qkv)
         self._register_start_trace('k', d_model_qkv)
@@ -166,13 +188,19 @@ class CTMAttention(nn.Module):
             'decay_alpha_k': None, 'decay_beta_k': None,
             'decay_alpha_v': None, 'decay_beta_v': None,
             'decay_alpha_o': None, 'decay_beta_o': None,
+            'prev_attn_out': None,
         }
 
     def _project_pool(self, x, pre_proj, nlm, trace, n_synch, side,
-                      decay_alpha, decay_beta, decay_params, out_proj):
+                      decay_alpha, decay_beta, decay_params, out_proj,
+                      inject_to_sync=None):
         """Run one pool's full pipeline for one tick.
 
         x:        (B, L, embed_dim) input for this pool's pre-projection.
+        inject_to_sync: optional (B*L, n_synch) tensor added to the slice of
+                  `activated` that the sync recurrence reads — the first
+                  n_synch neurons when side='first', the last n_synch when
+                  side='last'.
         Returns:  (projection, new_trace, new_alpha, new_beta) where projection
                   has shape (B, L, embed_dim).
         """
@@ -188,6 +216,13 @@ class CTMAttention(nn.Module):
         # 3. NLM activation: flatten (B, L) -> batch dim for SuperLinear
         nlm_in = new_trace.reshape(B * L, N, self.memory_length)
         activated = nlm(nlm_in)  # (B*L, N)
+
+        # 3b. Optional injection into the sync slice (out-of-place)
+        if inject_to_sync is not None:
+            if side == 'first':
+                activated = activated + F.pad(inject_to_sync, (0, N - n_synch))
+            else:  # 'last'
+                activated = activated + F.pad(inject_to_sync, (N - n_synch, 0))
 
         # 4. Decay rate r broadcast over the per-token batch
         sync_size = decay_params.shape[0]
@@ -240,23 +275,49 @@ class CTMAttention(nn.Module):
         if state is None:
             state = self._init_state(B, L_q, L_kv, query.device, query.dtype)
 
+        # prev-tick attn_out feedback into Q/K/V (None on first tick)
+        prev_attn_out = state.get('prev_attn_out')
+        # prev_attn_out has shape (B, L_q, embed_dim); apply to K/V only when
+        # sequence lengths match (true for self-attention, the only caller).
+        prev_matches_kv = (prev_attn_out is not None
+                           and prev_attn_out.size(1) == L_kv)
+
+        if prev_attn_out is not None:
+            q_in = query + self.prev_to_q(prev_attn_out)
+            inj_q = self.prev_to_sync_q(prev_attn_out).reshape(B * L_q, self.n_synch_qkv)
+        else:
+            q_in = query
+            inj_q = None
+
+        if prev_matches_kv:
+            k_in = key + self.prev_to_k(prev_attn_out)
+            v_in = value + self.prev_to_v(prev_attn_out)
+            inj_k = self.prev_to_sync_k(prev_attn_out).reshape(B * L_kv, self.n_synch_qkv)
+            inj_v = self.prev_to_sync_v(prev_attn_out).reshape(B * L_kv, self.n_synch_qkv)
+        else:
+            k_in, v_in = key, value
+            inj_k = inj_v = None
+
         Q, trace_q, alpha_q, beta_q = self._project_pool(
-            query, self.pre_q, self.nlm_q, state['trace_q'],
+            q_in, self.pre_q, self.nlm_q, state['trace_q'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_q'], state['decay_beta_q'],
-            self.decay_params_q, self.q_from_sync)
+            self.decay_params_q, self.q_from_sync,
+            inject_to_sync=inj_q)
 
         K, trace_k, alpha_k, beta_k = self._project_pool(
-            key, self.pre_k, self.nlm_k, state['trace_k'],
+            k_in, self.pre_k, self.nlm_k, state['trace_k'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_k'], state['decay_beta_k'],
-            self.decay_params_k, self.k_from_sync)
+            self.decay_params_k, self.k_from_sync,
+            inject_to_sync=inj_k)
 
         V, trace_v, alpha_v, beta_v = self._project_pool(
-            value, self.pre_v, self.nlm_v, state['trace_v'],
+            v_in, self.pre_v, self.nlm_v, state['trace_v'],
             self.n_synch_qkv, 'last',
             state['decay_alpha_v'], state['decay_beta_v'],
-            self.decay_params_v, self.v_from_sync)
+            self.decay_params_v, self.v_from_sync,
+            inject_to_sync=inj_v)
 
         # Multi-head split: (B, L, embed_dim) -> (B, num_heads, L, head_dim)
         def split_heads(t, L):
@@ -295,12 +356,19 @@ class CTMAttention(nn.Module):
         attn_out = torch.matmul(attn_dropped, Vh)  # (B, H, L_q, head_dim)
         attn_out = attn_out.transpose(1, 2).reshape(B, L_q, self.embed_dim)
 
-        # Output pool: feed attn_out through the same NLM+Sync pipeline
+        # Output pool: feed attn_out through the same NLM+Sync pipeline,
+        # and additionally inject attn_out into the first n_synch_o slots
+        # so the attention signal directly shapes sync.
+        inject_o = self.attn_to_sync_o(attn_out).reshape(B * L_q, self.n_synch_o)
         out, trace_o, alpha_o, beta_o = self._project_pool(
             attn_out, self.pre_o, self.nlm_o, state['trace_o'],
             self.n_synch_o, 'first',
             state['decay_alpha_o'], state['decay_beta_o'],
-            self.decay_params_o, self.o_from_sync)
+            self.decay_params_o, self.o_from_sync,
+            inject_to_sync=inject_o)
+
+        # Residual + LayerNorm so attn_out also reaches the head directly
+        out = self.out_norm(out + attn_out)
 
         new_state = {
             'trace_q': trace_q, 'trace_k': trace_k,
@@ -309,6 +377,7 @@ class CTMAttention(nn.Module):
             'decay_alpha_k': alpha_k, 'decay_beta_k': beta_k,
             'decay_alpha_v': alpha_v, 'decay_beta_v': beta_v,
             'decay_alpha_o': alpha_o, 'decay_beta_o': beta_o,
+            'prev_attn_out': attn_out,
         }
 
         if not need_weights:
