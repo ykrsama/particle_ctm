@@ -67,6 +67,20 @@ def _compute_sync_first_last(activated, n_synch, side, decay_alpha, decay_beta, 
     return synchronisation, decay_alpha, decay_beta
 
 
+class SwiGLU(nn.Module):
+    """Stateless Llama-style FFN (no bias): w3(dropout(SiLU(w1(x)) * w2(x)))."""
+
+    def __init__(self, d, d_ff, dropout=0.0):
+        super().__init__()
+        self.w1 = nn.Linear(d, d_ff, bias=False)
+        self.w2 = nn.Linear(d, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w3(self.drop(F.silu(self.w1(x)) * self.w2(x)))
+
+
 class CTMAttention(nn.Module):
     """Multi-head attention with Q/K/V/output projections built from NLMs + Sync.
 
@@ -92,7 +106,8 @@ class CTMAttention(nn.Module):
                  d_model_o=128,
                  n_synch_qkv=32,
                  n_synch_o=32,
-                 dropout=0.0):
+                 dropout=0.0,
+                 ffn_dim=None):
         super().__init__()
 
         if embed_dim % num_heads != 0:
@@ -150,6 +165,13 @@ class CTMAttention(nn.Module):
 
         # LayerNorm on the O-pool sync projection
         self.out_norm = nn.LayerNorm(embed_dim)
+
+        # SwiGLU FFN ("world-model knowledge base"); d_ff = 4 * d
+        if ffn_dim is None:
+            ffn_dim = 4 * embed_dim
+        self.ffn_dim = ffn_dim
+        self.ffn = SwiGLU(embed_dim, ffn_dim, dropout=dropout)
+        nn.init.zeros_(self.ffn.w3.weight)  # zero-init down-proj => no-op at start
 
         # Learnable initial traces, per pool: (N_pool, memory_length)
         self._register_start_trace('q', d_model_qkv)
@@ -361,6 +383,7 @@ class CTMAttention(nn.Module):
             self.decay_params_o, self.o_from_sync)
 
         out = self.out_norm(out)
+        out = out + self.ffn(out)  # stateless SwiGLU FFN with residual
 
         new_state = {
             'trace_q': trace_q, 'trace_k': trace_k,
