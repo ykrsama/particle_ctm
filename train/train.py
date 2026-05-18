@@ -210,8 +210,12 @@ def train_worker(cfg):
         batch_size=cfg['train']['batch_size'],
         num_workers=max(1, cfg['data']['num_workers'] // 2),
         max_num_particles=cfg['data']['max_num_particles'],
-        shuffle=False,
+        shuffle=True,
         rank=rank, world_size=world, seed=cfg['train']['seed'],
+        shuffle_buffer_size=cfg['data'].get('val_shuffle_buffer_size', shuffle_buf),
+        num_concurrent_files=num_concurrent,
+        rows_per_file_visit=rows_per_visit,
+        shard_by_rows=True,
     )
 
     # Optim + scheduler
@@ -243,6 +247,7 @@ def train_worker(cfg):
     data_wait_ms_acc = 0.0
     data_wait_ms_max = 0.0
     data_wait_n = 0
+    log_buf = []  # rank-0 per-step buffer, flushed at log_every boundary
     for step in range(total):
         t_wait = time.time()
         try:
@@ -284,29 +289,39 @@ def train_worker(cfg):
             optimizer.step()
             scheduler.step()
 
+        # rank-0 buffers per-step loss/acc/lr so the wandb curve has full
+        # resolution; the buffer is flushed at every log_every boundary below.
+        if rank == 0:
+            acc_step = calculate_accuracy(preds, y, where)
+            log_buf.append({
+                'train/loss': loss.item(),
+                'train/acc': float(acc_step),
+                'train/lr': scheduler.get_last_lr()[0],
+                'step': step,
+            })
+
         if rank == 0 and step % cfg['train']['log_every'] == 0:
-            acc = calculate_accuracy(preds, y, where)
+            last = log_buf[-1]
             ips = (step + 1) * cfg['train']['batch_size'] * world / max(time.time() - t0, 1e-6)
             data_wait_avg = data_wait_ms_acc / max(1, data_wait_n)
             data_wait_peak = data_wait_ms_max
             data_wait_ms_acc = 0.0
             data_wait_ms_max = 0.0
             data_wait_n = 0
-            print(f'step {step:6d} loss {loss.item():.4f} acc {acc:.4f} '
-                  f'lr {scheduler.get_last_lr()[0]:.2e} ips {ips:.0f} '
+            print(f'step {step:6d} loss {last["train/loss"]:.4f} acc {last["train/acc"]:.4f} '
+                  f'lr {last["train/lr"]:.2e} ips {ips:.0f} '
                   f'wait {data_wait_avg:.1f}/{data_wait_peak:.1f}ms', flush=True)
             if use_wandb:
-                # Class distribution of the current batch (sanity check that
-                # the shuffle buffer is producing diverse batches).
+                # (a) per-step points — one wandb row per buffered step.
+                for entry in log_buf:
+                    wandb.log(entry)
+                # (b) heavy aggregates and charts — one row at the current step.
                 B = preds.size(0)
                 bi = torch.arange(B, device=preds.device)
                 pred_idx_now = preds.argmax(dim=1)[bi, where]
                 true_now = y.detach().cpu().numpy()
                 pred_now = pred_idx_now.detach().cpu().numpy()
                 wandb.log({
-                    'train/loss': loss.item(),
-                    'train/acc': float(acc),
-                    'train/lr': scheduler.get_last_lr()[0],
                     'train/ips': ips,
                     # Data-pipeline starvation: time spent blocked on the
                     # DataLoader queue. <5 ms = healthy prefetch; persistent
@@ -319,9 +334,10 @@ def train_worker(cfg):
                         _label_hist(true_now, mcfg['num_classes'], 'train true labels'),
                     'train/confusion':
                         _confusion_plot(true_now, pred_now, mcfg['num_classes'],
-                                        'train true vs predicted'),
+                                        'train confusion'),
                     'step': step,
                 })
+            log_buf.clear()
 
         if step > 0 and step % cfg['train']['val_every'] == 0:
             val_loss, val_acc, val_true, val_pred = evaluate(model, val_loader, device)
@@ -339,8 +355,9 @@ def train_worker(cfg):
                         'val/loss': val_loss, 'val/acc': val_acc,
                         'val/true_label_dist':
                             _label_hist(val_true, mcfg['num_classes'], 'val true labels'),
-                        'val/pred_label_dist':
-                            _label_hist(val_pred, mcfg['num_classes'], 'val predicted labels'),
+                        'val/confusion':
+                            _confusion_plot(val_true, val_pred, mcfg['num_classes'],
+                                            'val confusion'),
                         'step': step,
                     })
                 if val_acc > best_val_acc:
