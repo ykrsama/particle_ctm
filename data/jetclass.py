@@ -183,7 +183,8 @@ class JetClassIterableDataset(IterableDataset):
                  world_size=1,
                  shuffle_buffer_size=20000,
                  num_concurrent_files=10,
-                 rows_per_file_visit=10000):
+                 rows_per_file_visit=10000,
+                 shard_by_rows=False):
         """
         shuffle_buffer_size: rows held in the streaming shuffle buffer per
             worker. 0 disables shuffling entirely (eval mode).
@@ -215,6 +216,7 @@ class JetClassIterableDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.num_concurrent_files = max(1, num_concurrent_files)
         self.rows_per_file_visit = rows_per_file_visit
+        self.shard_by_rows = shard_by_rows
 
     def _shard_files(self, rank, world, worker_id, num_workers, epoch):
         """Return (files_for_this_shard, row_stride, row_offset).
@@ -233,6 +235,11 @@ class JetClassIterableDataset(IterableDataset):
         total_shards = world * num_workers
         shard_idx = rank * num_workers + worker_id
 
+        # shard_by_rows: every shard reads every file but takes row stride —
+        # required when files are class-pure and len(files)/total_shards <
+        # num_classes (file-level sharding would otherwise drop classes).
+        if self.shard_by_rows:
+            return files, total_shards, shard_idx
         if len(files) >= total_shards:
             return files[shard_idx::total_shards], 1, 0
         # Few-file regime — replicate file list, slice rows instead.
@@ -406,7 +413,8 @@ def build_dataloader(file_glob, batch_size, num_workers=4,
                      rank=0, world_size=1, seed=42,
                      shuffle_buffer_size=20000,
                      num_concurrent_files=10,
-                     rows_per_file_visit=10000):
+                     rows_per_file_visit=10000,
+                     shard_by_rows=False):
     ds = JetClassIterableDataset(
         file_glob,
         max_num_particles=max_num_particles,
@@ -418,6 +426,7 @@ def build_dataloader(file_glob, batch_size, num_workers=4,
         shuffle_buffer_size=shuffle_buffer_size if shuffle else 0,
         num_concurrent_files=num_concurrent_files,
         rows_per_file_visit=rows_per_file_visit,
+        shard_by_rows=shard_by_rows,
     )
     return torch.utils.data.DataLoader(
         ds, batch_size=batch_size, num_workers=num_workers,
