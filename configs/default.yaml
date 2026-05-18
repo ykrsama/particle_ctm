@@ -45,15 +45,19 @@ model:
 
 train:
   batch_size: 256
-  lr: 3.0e-4
+  lr: 2.0e-4
   weight_decay: 1.0e-4
-  warmup_steps: 200
+  warmup_steps: 300
   total_steps: 50000
   log_every: 50
   val_every: 500
   seed: 42
   use_amp: true
   grad_clip: 5.0
+  # Gradient checkpointing on the CTM tick loop. Trades ~30-40% training time
+  # for huge activation memory savings (O(T) → O(1) ticks held in memory).
+  # Required at T=45, B=256 on 80 GB GPUs; set false only for small models.
+  use_grad_checkpoint: true
 
 ray:
   num_workers: 4         # number of GPUs

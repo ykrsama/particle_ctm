@@ -111,6 +111,10 @@ def evaluate(model, loader, device, max_batches=200):
 # Per-worker training function (called by ray.train.torch.TorchTrainer)
 # ---------------------------------------------------------------------------
 def train_worker(cfg):
+    # Reduce CUDA allocator fragmentation. Must be set before the first CUDA
+    # tensor allocation; setdefault keeps any explicit env override the user set.
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
     # Ray workers don't inherit the driver's sys.path. Re-inject the project
     # root (stored in cfg by main()) and re-import package modules locally.
     import sys as _sys
@@ -177,6 +181,7 @@ def train_worker(cfg):
         trim=mcfg['trim'],
         fc_params=tuple(tuple(x) for x in mcfg['fc_params']),
         activation=mcfg['activation'],
+        use_grad_checkpoint=cfg['train'].get('use_grad_checkpoint', True),
     ).to(device)
     model = ray.train.torch.prepare_model(model)
 

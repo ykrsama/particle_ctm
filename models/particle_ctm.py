@@ -15,9 +15,30 @@ CTMAttention itself; the rest of the module is stateless within a forward.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from .ctm.ctm_attention import CTMAttention
 from .part_layers import Embed, PairEmbed, SequenceTrimmer, trunc_normal_
+
+
+# Schema for CTMAttention state dict. Used to flatten/unflatten so the dict can
+# pass through torch.utils.checkpoint (which expects positional tensor args).
+_STATE_KEYS = (
+    'trace_q', 'trace_k', 'trace_v', 'trace_o',
+    'decay_alpha_q', 'decay_beta_q',
+    'decay_alpha_k', 'decay_beta_k',
+    'decay_alpha_v', 'decay_beta_v',
+    'decay_alpha_o', 'decay_beta_o',
+    'prev_out',
+)
+
+
+def _flatten_state(state):
+    return tuple(state[k] for k in _STATE_KEYS)
+
+
+def _unflatten_state(flat):
+    return dict(zip(_STATE_KEYS, flat))
 
 
 def compute_normalized_entropy(logits, reduction='mean'):
@@ -54,7 +75,8 @@ class ParticleCTM(nn.Module):
                  # misc
                  trim=True,
                  fc_params=(),
-                 activation='gelu'):
+                 activation='gelu',
+                 use_grad_checkpoint=True):
         super().__init__()
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
@@ -62,6 +84,7 @@ class ParticleCTM(nn.Module):
         self.iterations = iterations
         self.num_heads = num_heads
         self.num_classes = num_classes
+        self.use_grad_checkpoint = use_grad_checkpoint
 
         self.trimmer = SequenceTrimmer(enabled=trim)
         self.embed = Embed(input_dim, list(embed_dims), activation=activation) \
@@ -154,13 +177,31 @@ class ParticleCTM(nn.Module):
         sync_o_history = [] if track else None
 
         state = None
-        for t in range(T):
-            out, attn_w, state = self.ctm_attention(
-                seq, seq, seq, state=state,
-                attn_mask=attn_mask,
-                key_padding_mask=kp_mask,
-                need_weights=track,
+        do_ckpt = self.use_grad_checkpoint and self.training and not track
+
+        def _tick_fn(seq_in, *state_flat):
+            st = _unflatten_state(state_flat)
+            out_, _w, new_st = self.ctm_attention(
+                seq_in, seq_in, seq_in, state=st,
+                attn_mask=attn_mask, key_padding_mask=kp_mask,
+                need_weights=False,
             )
+            return (out_,) + _flatten_state(new_st)
+
+        for t in range(T):
+            if do_ckpt and state is not None:
+                ret = _ckpt(_tick_fn, seq, *_flatten_state(state),
+                            use_reentrant=False)
+                out, new_state_flat = ret[0], ret[1:]
+                state = _unflatten_state(new_state_flat)
+                attn_w = None
+            else:
+                out, attn_w, state = self.ctm_attention(
+                    seq, seq, seq, state=state,
+                    attn_mask=attn_mask,
+                    key_padding_mask=kp_mask,
+                    need_weights=track,
+                )
             cls_out = self.norm(out[:, 0])
             logits = self.head(cls_out)
             ne = compute_normalized_entropy(logits)
