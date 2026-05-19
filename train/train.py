@@ -275,17 +275,28 @@ def train_worker(cfg):
             state = {k.replace('module.', '', 1): v for k, v in state.items()}
             missing, unexpected = base_model.load_state_dict(state, strict=False)
             if 'optimizer_state_dict' in ck:
+                # Full resume: ckpt was written by this script's val-tick save,
+                # so optimizer/scheduler/scaler/step/best_val_acc all line up.
                 optimizer.load_state_dict(ck['optimizer_state_dict'])
-            if 'scheduler_state_dict' in ck:
-                scheduler.load_state_dict(ck['scheduler_state_dict'])
-            if scaler is not None and ck.get('scaler_state_dict') is not None:
-                scaler.load_state_dict(ck['scaler_state_dict'])
-            start_step = int(ck.get('step', 0))
-            # Older single-save format stored the metric under 'val_acc'.
-            best_val_acc = float(ck.get('best_val_acc',
-                                        ck.get('val_acc', best_val_acc)))
+                if 'scheduler_state_dict' in ck:
+                    scheduler.load_state_dict(ck['scheduler_state_dict'])
+                if scaler is not None and ck.get('scaler_state_dict') is not None:
+                    scaler.load_state_dict(ck['scaler_state_dict'])
+                start_step = int(ck.get('step', 0))
+                # Older single-save format stored the metric under 'val_acc'.
+                best_val_acc = float(ck.get('best_val_acc',
+                                            ck.get('val_acc', best_val_acc)))
+                mode = 'resume'
+            else:
+                # Model-only checkpoint (e.g. an old best.pt from a previous
+                # run). Warm-start: fresh optimizer/scheduler/scaler so the
+                # new run gets a proper warmup; reset start_step and
+                # best_val_acc so the new run_dir gets its own best.pt as
+                # soon as it validates, instead of waiting to beat the prior
+                # run's metric. Ignore the ckpt's `step` / `val_acc` fields.
+                mode = 'warm-start'
             if rank == 0:
-                print(f'[resume] from {resume_from} at step {start_step} '
+                print(f'[{mode}] from {resume_from} at step {start_step} '
                       f'(best_val_acc={best_val_acc:.4f}); '
                       f'missing={len(missing)} unexpected={len(unexpected)}',
                       flush=True)
