@@ -172,6 +172,10 @@ class CTMAttention(nn.Module):
         self.ffn_dim = ffn_dim
         self.ffn = SwiGLU(embed_dim, ffn_dim, dropout=dropout)
         nn.init.zeros_(self.ffn.w3.weight)  # zero-init down-proj => no-op at start
+        # Normalise the post-FFN output before it is fed back as prev_out to
+        # the next tick; without this, FFN residual magnitudes compound across
+        # ticks via the prev_out -> Q/K/V/sync loopback.
+        self.post_ffn_norm = nn.LayerNorm(embed_dim)
 
         # Learnable initial traces, per pool: (N_pool, memory_length)
         self._register_start_trace('q', d_model_qkv)
@@ -179,11 +183,13 @@ class CTMAttention(nn.Module):
         self._register_start_trace('v', d_model_qkv)
         self._register_start_trace('o', d_model_o)
 
-        # Learnable decay parameters per pool: clamped & exponentiated to give r
-        self.decay_params_q = nn.Parameter(torch.zeros(self.sync_size_qkv))
-        self.decay_params_k = nn.Parameter(torch.zeros(self.sync_size_qkv))
-        self.decay_params_v = nn.Parameter(torch.zeros(self.sync_size_qkv))
-        self.decay_params_o = nn.Parameter(torch.zeros(self.sync_size_o))
+        # Learnable decay parameters per pool: clamped & exponentiated to give r.
+        # Init at 1.0 (r = exp(-1) ≈ 0.37) instead of 0.0 (r = 1, unbounded
+        # accumulation) so the sync recurrence has real decay from the start.
+        self.decay_params_q = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
+        self.decay_params_k = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
+        self.decay_params_v = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
+        self.decay_params_o = nn.Parameter(torch.full((self.sync_size_o,), 1.0))
 
     def _register_start_trace(self, name, n_neurons):
         bound = math.sqrt(1.0 / (n_neurons + self.memory_length))
@@ -383,7 +389,7 @@ class CTMAttention(nn.Module):
             self.decay_params_o, self.o_from_sync)
 
         out = self.out_norm(out)
-        out = out + self.ffn(out)  # stateless SwiGLU FFN with residual
+        out = self.post_ffn_norm(out + self.ffn(out))  # SwiGLU FFN + residual + norm
 
         new_state = {
             'trace_q': trace_q, 'trace_k': trace_k,

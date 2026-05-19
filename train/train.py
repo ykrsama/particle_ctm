@@ -239,7 +239,16 @@ def train_worker(cfg):
         return 0.5 * (1 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    scaler = torch.amp.GradScaler('cuda') if cfg['train']['use_amp'] else None
+    # AMP dtype:
+    #   bf16 — same exponent range as fp32, no GradScaler needed (default).
+    #   fp16 — needs GradScaler; can overflow in long CTM sync recurrences.
+    #   none — pure fp32.
+    amp_dtype_str = cfg['train'].get(
+        'amp_dtype', 'bf16' if cfg['train'].get('use_amp', True) else 'none')
+    amp_dtype = {'bf16': torch.bfloat16,
+                 'fp16': torch.float16,
+                 'none': None}[amp_dtype_str]
+    scaler = torch.amp.GradScaler('cuda') if amp_dtype is torch.float16 else None
 
     best_val_acc = -float('inf')
     best_ckpt = os.path.join(run_dir, out_cfg.get('ckpt_name', 'best.pt'))
@@ -271,10 +280,24 @@ def train_worker(cfg):
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        if scaler is not None:
-            with torch.amp.autocast('cuda'):
+        if amp_dtype is not None:
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
                 preds, certs = model(x_feat, v=x_vec, mask=mask)
                 loss, where = get_loss(preds, certs, y)
+        else:
+            preds, certs = model(x_feat, v=x_vec, mask=mask)
+            loss, where = get_loss(preds, certs, y)
+
+        # NaN guard: a single freak batch shouldn't pollute grads. GradScaler
+        # handles inf/NaN at unscale time, but a near-overflow finite-but-huge
+        # loss can still push params toward the overflow corner before NaN
+        # actually appears.
+        if not torch.isfinite(loss):
+            if rank == 0:
+                print(f'[skip] step {step} non-finite loss {loss.item()}', flush=True)
+            continue
+
+        if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip'])
@@ -287,8 +310,6 @@ def train_worker(cfg):
             if scaler.get_scale() >= scale_before:
                 scheduler.step()
         else:
-            preds, certs = model(x_feat, v=x_vec, mask=mask)
-            loss, where = get_loss(preds, certs, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip'])
             optimizer.step()
