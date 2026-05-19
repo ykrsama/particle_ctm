@@ -195,12 +195,10 @@ class CTMAttention(nn.Module):
         self._register_start_trace('o', d_model_o)
 
         # Learnable decay parameters per pool: clamped & exponentiated to give r.
-        # Init at 1.0 (r = exp(-1) ≈ 0.37) instead of 0.0 (r = 1, unbounded
-        # accumulation) so the sync recurrence has real decay from the start.
-        self.decay_params_q = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
-        self.decay_params_k = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
-        self.decay_params_v = nn.Parameter(torch.full((self.sync_size_qkv,), 1.0))
-        self.decay_params_o = nn.Parameter(torch.full((self.sync_size_o,), 1.0))
+        self.decay_params_q = nn.Parameter(torch.zeros(self.sync_size_qkv))
+        self.decay_params_k = nn.Parameter(torch.zeros(self.sync_size_qkv))
+        self.decay_params_v = nn.Parameter(torch.zeros(self.sync_size_qkv))
+        self.decay_params_o = nn.Parameter(torch.zeros(self.sync_size_o))
 
     def _register_start_trace(self, name, n_neurons):
         bound = math.sqrt(1.0 / (n_neurons + self.memory_length))

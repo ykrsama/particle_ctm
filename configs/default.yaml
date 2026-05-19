@@ -47,9 +47,9 @@ model:
 train:
   batch_size: 256
   lr: 2.0e-4
-  weight_decay: 1.0e-4
-  warmup_steps: 300
-  total_steps: 50000
+  weight_decay: 0.0 # 1.0e-4
+  warmup_steps: 200
+  total_steps:  50000
   log_every: 50
   val_every: 500
   seed: 42
@@ -58,7 +58,7 @@ train:
   # it won't overflow in the CTM sync recurrence; fp16 needs GradScaler and
   # can NaN under long iterations.
   amp_dtype: bf16
-  grad_clip: 5.0
+  grad_clip: 20.0
   # Gradient checkpointing on the CTM tick loop. Trades ~30-40% training time
   # for huge activation memory savings (O(T) → O(1) ticks held in memory).
   # Required at T=45, B=256 on 80 GB GPUs; set false only for small models.
