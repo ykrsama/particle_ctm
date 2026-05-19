@@ -46,10 +46,10 @@ model:
 
 train:
   batch_size: 256
-  lr: 5.0e-4
+  lr: 3.0e-4
   weight_decay: 0.0 # 1.0e-4
   warmup_steps: 500
-  total_steps:  30000
+  total_steps:  50000
   log_every: 50
   val_every: 500
   seed: 42
