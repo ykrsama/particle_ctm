@@ -78,6 +78,7 @@ def build_model_from_cfg(cfg, device):
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
         memory_length=mcfg['memory_length'],
+        memory_hidden_dims=mcfg.get('memory_hidden_dims', None),
         d_model_qkv=mcfg['d_model_qkv'],
         d_model_o=mcfg['d_model_o'],
         n_synch_qkv=mcfg['n_synch_qkv'],

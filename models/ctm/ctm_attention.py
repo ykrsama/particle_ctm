@@ -15,17 +15,27 @@ import torch.nn.functional as F
 from .modules import SuperLinear, Squeeze
 
 
-def _build_nlm(memory_length, n_neurons, dropout=0.0):
-    """Single-SuperLinear NLM.
+def _build_nlm(memory_length, n_neurons, memory_hidden_dims=None, dropout=0.0):
+    """NLM. Shallow when memory_hidden_dims is None; deep (2-layer) otherwise.
 
     Input shape:  (B, n_neurons, memory_length)
     Output shape: (B, n_neurons)
     """
+    if memory_hidden_dims is None:
+        return nn.Sequential(
+            SuperLinear(in_dims=memory_length, out_dims=2,
+                        N=n_neurons, dropout=dropout),
+            nn.GLU(),
+            Squeeze(-1),
+        )
     return nn.Sequential(
-        SuperLinear(in_dims=memory_length, out_dims=2,
+        SuperLinear(in_dims=memory_length, out_dims=2 * memory_hidden_dims,
                     N=n_neurons, dropout=dropout),
         nn.GLU(),
-        Squeeze(-1)
+        SuperLinear(in_dims=memory_hidden_dims, out_dims=2,
+                    N=n_neurons, dropout=dropout),
+        nn.GLU(),
+        Squeeze(-1),
     )
 
 
@@ -102,6 +112,7 @@ class CTMAttention(nn.Module):
                  embed_dim,
                  num_heads,
                  memory_length=4,
+                 memory_hidden_dims=None,
                  d_model_qkv=128,
                  d_model_o=128,
                  n_synch_qkv=32,
@@ -138,10 +149,10 @@ class CTMAttention(nn.Module):
         self.pre_o = nn.Linear(embed_dim, d_model_o)
 
         # NLM trace processors, one per pool
-        self.nlm_q = _build_nlm(memory_length, d_model_qkv, dropout)
-        self.nlm_k = _build_nlm(memory_length, d_model_qkv, dropout)
-        self.nlm_v = _build_nlm(memory_length, d_model_qkv, dropout)
-        self.nlm_o = _build_nlm(memory_length, d_model_o, dropout)
+        self.nlm_q = _build_nlm(memory_length, d_model_qkv, memory_hidden_dims, dropout)
+        self.nlm_k = _build_nlm(memory_length, d_model_qkv, memory_hidden_dims, dropout)
+        self.nlm_v = _build_nlm(memory_length, d_model_qkv, memory_hidden_dims, dropout)
+        self.nlm_o = _build_nlm(memory_length, d_model_o, memory_hidden_dims, dropout)
 
         # Sync -> embed_dim projections
         self.q_from_sync = nn.Linear(self.sync_size_qkv, embed_dim)
