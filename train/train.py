@@ -195,6 +195,27 @@ def train_worker(cfg):
     # Clamp decay params before every forward (CTM stability).
     base_model = model.module if hasattr(model, 'module') else model
 
+    if rank == 0:
+        # Dump the resolved architecture once. Several config knobs mutate
+        # the actual structure invisibly (PairEmbed appends [num_heads],
+        # sync_size = n_synch*(n_synch+1)/2 sets the *_from_sync Linear input
+        # dim, memory_hidden_dims toggles shallow vs 2-layer NLM, etc.) so the
+        # printed tree + param table is the ground truth for what was built.
+        total = sum(p.numel() for p in base_model.parameters())
+        trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+        print('=' * 72, flush=True)
+        print(base_model, flush=True)
+        print('-' * 72, flush=True)
+        print(f'{"submodule":40s} {"params":>12s}  {"%":>5s}', flush=True)
+        for name, sub in base_model.named_children():
+            n = sum(p.numel() for p in sub.parameters())
+            if n > 0:
+                print(f'{name:40s} {n:12,d}  {100 * n / total:5.1f}', flush=True)
+        print('-' * 72, flush=True)
+        print(f'{"TOTAL":40s} {total:12,d}  100.0', flush=True)
+        print(f'{"trainable":40s} {trainable:12,d}', flush=True)
+        print('=' * 72, flush=True)
+
     def clamp_decay_params(_module, _input):
         with torch.no_grad():
             for name in ('decay_params_q', 'decay_params_k',
