@@ -146,11 +146,17 @@ def train_worker(cfg):
     # wandb on rank 0; its local files go inside the run dir.
     use_wandb = rank == 0 and cfg['wandb']['mode'] != 'disabled'
     if use_wandb:
+        # `resume='allow' + id=run_name` makes resubmissions of a named run
+        # continue the same wandb run instead of opening a new panel. wandb
+        # run ids must be unique per project and filename-safe; the timestamped
+        # run_name already satisfies both.
         wandb.init(
             project=cfg['wandb']['project'],
             entity=cfg['wandb']['entity'],
             mode=cfg['wandb']['mode'],
             name=run_name,
+            id=run_name,
+            resume='allow',
             config={k: v for k, v in cfg.items() if not k.startswith('_')},
             dir=run_dir,
         )
@@ -251,8 +257,61 @@ def train_worker(cfg):
     scaler = torch.amp.GradScaler('cuda') if amp_dtype is torch.float16 else None
 
     best_val_acc = -float('inf')
+    start_step = 0
     best_ckpt = os.path.join(run_dir, out_cfg.get('ckpt_name', 'best.pt'))
     last_ckpt = os.path.join(run_dir, 'last.pt')
+
+    # Resume from a previous full-state checkpoint, if requested. Combined
+    # with a fixed output.run_name (so run_dir is deterministic), this turns
+    # the same config into an idempotent submit-once-restart-as-needed
+    # workflow: first submission finds no file and starts fresh; later
+    # submissions find last.pt and continue.
+    resume_from = cfg['train'].get('resume_from')
+    explicit_run_name = bool(out_cfg.get('run_name_explicit'))
+    if resume_from:
+        if os.path.isfile(resume_from):
+            ck = torch.load(resume_from, map_location=device, weights_only=False)
+            state = ck['model_state_dict']
+            state = {k.replace('module.', '', 1): v for k, v in state.items()}
+            missing, unexpected = base_model.load_state_dict(state, strict=False)
+            if 'optimizer_state_dict' in ck:
+                optimizer.load_state_dict(ck['optimizer_state_dict'])
+            if 'scheduler_state_dict' in ck:
+                scheduler.load_state_dict(ck['scheduler_state_dict'])
+            if scaler is not None and ck.get('scaler_state_dict') is not None:
+                scaler.load_state_dict(ck['scaler_state_dict'])
+            start_step = int(ck.get('step', 0))
+            # Older single-save format stored the metric under 'val_acc'.
+            best_val_acc = float(ck.get('best_val_acc',
+                                        ck.get('val_acc', best_val_acc)))
+            if rank == 0:
+                print(f'[resume] from {resume_from} at step {start_step} '
+                      f'(best_val_acc={best_val_acc:.4f}); '
+                      f'missing={len(missing)} unexpected={len(unexpected)}',
+                      flush=True)
+        elif explicit_run_name:
+            # First submission of a named job — expected, silent log only.
+            if rank == 0:
+                print(f'[resume] no checkpoint at {resume_from}; starting fresh '
+                      f'(run_name={out_cfg.get("run_name")})', flush=True)
+        else:
+            if rank == 0:
+                print(f'[resume] WARNING: resume_from not found and run_name '
+                      f'is auto-generated: {resume_from}; starting from '
+                      f'random init', flush=True)
+
+    def _full_state(next_step):
+        """Full training state for resume. `next_step` is the step the run
+        should pick up at on resubmission (i.e. step + 1)."""
+        return {
+            'model_state_dict': base_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+            'step': int(next_step),
+            'best_val_acc': float(best_val_acc),
+            'config': cfg,
+        }
 
     model.train()
     iterator = iter(train_loader)
@@ -262,7 +321,7 @@ def train_worker(cfg):
     data_wait_ms_max = 0.0
     data_wait_n = 0
     log_buf = []  # rank-0 per-step buffer, flushed at log_every boundary
-    for step in range(total):
+    for step in range(start_step, total):
         t_wait = time.time()
         try:
             x_feat, x_vec, mask, y = next(iterator)
@@ -397,15 +456,16 @@ def train_worker(cfg):
                     if use_wandb:
                         wandb.run.summary['best_val_acc'] = best_val_acc
                         wandb.run.summary['best_step'] = step
+                # Full-state checkpoint for resume after job kill. Saved every
+                # val tick so the most we can lose on preemption is val_every
+                # steps of work.
+                torch.save(_full_state(next_step=step + 1), last_ckpt)
 
-    # Optionally save the final weights too (regardless of best-acc tracking).
+    # Optionally save the final full-state weights too (regardless of best-acc
+    # tracking). Same schema as the val-tick saves so the end-of-run last.pt is
+    # also a valid resume point.
     if rank == 0 and out_cfg.get('save_last', True):
-        torch.save({
-            'model_state_dict': base_model.state_dict(),
-            'config': cfg,
-            'step': cfg['train']['total_steps'],
-            'val_acc': best_val_acc,
-        }, last_ckpt)
+        torch.save(_full_state(next_step=cfg['train']['total_steps']), last_ckpt)
 
     if rank == 0 and use_wandb:
         wandb.finish()
@@ -452,12 +512,16 @@ def main():
     out_dir = out_cfg.get('dir', 'runs')
     if not os.path.isabs(out_dir):
         out_dir = os.path.abspath(os.path.join(cfg_dir, '..', out_dir))
-    run_name = out_cfg.get('run_name') or \
+    user_run_name = out_cfg.get('run_name')
+    run_name = user_run_name or \
         f"particle-ctm-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     run_dir = os.path.join(out_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     cfg['output']['dir'] = out_dir
     cfg['output']['run_name'] = run_name
+    # Distinguish a user-set run_name (resume-friendly) from an auto-generated
+    # timestamp (every relaunch creates a new run dir, can never resume).
+    cfg['output']['run_name_explicit'] = user_run_name is not None
     cfg['output']['run_dir'] = run_dir
     cfg['output'].setdefault('ckpt_name', 'best.pt')
     cfg['output'].setdefault('save_last', True)

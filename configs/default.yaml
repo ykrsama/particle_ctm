@@ -62,6 +62,13 @@ train:
   # for huge activation memory savings (O(T) → O(1) ticks held in memory).
   # Required at T=45, B=256 on 80 GB GPUs; set false only for small models.
   use_grad_checkpoint: true
+  # Absolute path to a full-state checkpoint to resume from. Combined with a
+  # fixed `output.run_name`, this turns the same config into an idempotent
+  # submit-once-restart-as-needed workflow: on the first submission the file
+  # doesn't exist yet and training starts fresh silently; on resubmission the
+  # file is found and training continues with model + optimizer + scheduler +
+  # scaler + step + best_val_acc restored. Set null to disable.
+  resume_from: null
 
 ray:
   num_workers: 4         # number of GPUs
