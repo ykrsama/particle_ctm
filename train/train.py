@@ -61,6 +61,45 @@ def _confusion_plot(true_labels, pred_labels, num_classes, title):
     )
 
 
+def _small_param_log(base_model, step):
+    """Snapshot small but informative learnable params for wandb.
+
+    Covers per-head scalars (c_attn, log_tau / tau), sync-decay distributions
+    (decay_params_{q,k,v,o} as histograms + mean/std), QK-norm affine weights,
+    and the cls_token. Cheap — runs at log_every cadence on rank 0 only.
+    """
+    import wandb as _wandb
+    ca = base_model.ctm_attention
+    out = {'step': step}
+
+    for i, v in enumerate(ca.c_attn.detach().float().cpu().tolist()):
+        out[f'params/c_attn/h{i}'] = v
+    log_tau = ca.log_tau.detach().float().cpu()
+    for i in range(log_tau.numel()):
+        lt = float(log_tau[i])
+        out[f'params/log_tau/h{i}'] = lt
+        out[f'params/tau/h{i}'] = float(log_tau[i].exp())
+
+    for name in ('decay_params_q', 'decay_params_k',
+                 'decay_params_v', 'decay_params_o'):
+        t = getattr(ca, name).detach().float().cpu()
+        out[f'params/{name}/hist'] = _wandb.Histogram(t.numpy())
+        out[f'params/{name}/mean'] = float(t.mean())
+        out[f'params/{name}/std'] = float(t.std())
+
+    for name in ('q_norm', 'k_norm'):
+        w = getattr(ca, name).weight.detach().float().cpu()
+        out[f'params/{name}/mean'] = float(w.mean())
+        out[f'params/{name}/std'] = float(w.std())
+        out[f'params/{name}/norm'] = float(w.norm())
+
+    cls = base_model.cls_token.detach().float().cpu().flatten()
+    out['params/cls_token/norm'] = float(cls.norm())
+    out['params/cls_token/mean'] = float(cls.mean())
+    out['params/cls_token/std'] = float(cls.std())
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
@@ -457,6 +496,7 @@ def train_worker(cfg):
                                         'train confusion'),
                     'step': step,
                 })
+                wandb.log(_small_param_log(base_model, step))
             log_buf.clear()
 
         if step > 0 and step % cfg['train']['val_every'] == 0:

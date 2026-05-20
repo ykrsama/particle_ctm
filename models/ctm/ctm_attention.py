@@ -39,7 +39,8 @@ def _build_nlm(memory_length, n_neurons, memory_hidden_dims=None, dropout=0.0):
     )
 
 
-def _compute_sync_first_last(activated, n_synch, side, decay_alpha, decay_beta, r):
+def _compute_sync_first_last(activated, n_synch, side, decay_alpha, decay_beta,
+                             r, triu_i, triu_j):
     """Synchronization recurrence over the `first-last` neuron slice.
 
     Args:
@@ -49,6 +50,7 @@ def _compute_sync_first_last(activated, n_synch, side, decay_alpha, decay_beta, 
         decay_alpha:  (B_flat, sync_size) or None on first tick.
         decay_beta:   (B_flat, sync_size) or None on first tick.
         r:            (B_flat, sync_size) exponential decay rate per pair.
+        triu_i, triu_j: (sync_size,) precomputed upper-triangular indices.
 
     Returns:
         synchronisation: (B_flat, sync_size)
@@ -63,8 +65,7 @@ def _compute_sync_first_last(activated, n_synch, side, decay_alpha, decay_beta, 
         raise ValueError(f"unknown side: {side}")
 
     outer = selected.unsqueeze(2) * selected.unsqueeze(1)
-    i, j = torch.triu_indices(n_synch, n_synch, device=activated.device)
-    pairwise_product = outer[:, i, j]
+    pairwise_product = outer[:, triu_i, triu_j]
 
     if decay_alpha is None or decay_beta is None:
         decay_alpha = pairwise_product
@@ -198,6 +199,15 @@ class CTMAttention(nn.Module):
         self.decay_params_v = nn.Parameter(torch.zeros(self.sync_size_qkv))
         self.decay_params_o = nn.Parameter(torch.zeros(self.sync_size_o))
 
+        # Precomputed upper-triangular indices for the sync outer product.
+        # Same for all three QKV pools (n_synch_qkv) and a separate pair for O.
+        triu_qkv = torch.triu_indices(n_synch_qkv, n_synch_qkv)
+        triu_o = torch.triu_indices(n_synch_o, n_synch_o)
+        self.register_buffer('triu_i_qkv', triu_qkv[0], persistent=False)
+        self.register_buffer('triu_j_qkv', triu_qkv[1], persistent=False)
+        self.register_buffer('triu_i_o', triu_o[0], persistent=False)
+        self.register_buffer('triu_j_o', triu_o[1], persistent=False)
+
         # ParT-style per-head output scaling; ones-init => no-op at start.
         self.c_attn = nn.Parameter(torch.ones(num_heads))
         # Per-head learnable softmax temperature; zeros-init => exp(0)=1, so
@@ -232,7 +242,7 @@ class CTMAttention(nn.Module):
 
     def _project_pool(self, x, pre_proj, nlm, trace, n_synch, side,
                       decay_alpha, decay_beta, decay_params, out_proj,
-                      inject_to_sync=None):
+                      triu_i, triu_j, inject_to_sync=None):
         """Run one pool's full pipeline for one tick.
 
         x:        (B, L, embed_dim) input for this pool's pre-projection.
@@ -276,7 +286,8 @@ class CTMAttention(nn.Module):
             decay_beta_flat = None
 
         sync_flat, new_alpha_flat, new_beta_flat = _compute_sync_first_last(
-            activated, n_synch, side, decay_alpha_flat, decay_beta_flat, r)
+            activated, n_synch, side, decay_alpha_flat, decay_beta_flat, r,
+            triu_i, triu_j)
 
         # 6. Project sync -> embed_dim and reshape back to (B, L, embed_dim)
         projection = out_proj(sync_flat).reshape(B, L, self.embed_dim)
@@ -336,19 +347,22 @@ class CTMAttention(nn.Module):
             q_in, self.pre_q, self.nlm_q, state['trace_q'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_q'], state['decay_beta_q'],
-            self.decay_params_q, self.q_from_sync)
+            self.decay_params_q, self.q_from_sync,
+            self.triu_i_qkv, self.triu_j_qkv)
 
         K, trace_k, alpha_k, beta_k = self._project_pool(
             k_in, self.pre_k, self.nlm_k, state['trace_k'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_k'], state['decay_beta_k'],
-            self.decay_params_k, self.k_from_sync)
+            self.decay_params_k, self.k_from_sync,
+            self.triu_i_qkv, self.triu_j_qkv)
 
         V, trace_v, alpha_v, beta_v = self._project_pool(
             v_in, self.pre_v, self.nlm_v, state['trace_v'],
             self.n_synch_qkv, 'last',
             state['decay_alpha_v'], state['decay_beta_v'],
-            self.decay_params_v, self.v_from_sync)
+            self.decay_params_v, self.v_from_sync,
+            self.triu_i_qkv, self.triu_j_qkv)
 
         # Multi-head split: (B, L, embed_dim) -> (B, num_heads, L, head_dim)
         def split_heads(t, L):
@@ -400,7 +414,8 @@ class CTMAttention(nn.Module):
             attn_out, self.pre_o, self.nlm_o, state['trace_o'],
             self.n_synch_o, 'first',
             state['decay_alpha_o'], state['decay_beta_o'],
-            self.decay_params_o, self.o_from_sync)
+            self.decay_params_o, self.o_from_sync,
+            self.triu_i_o, self.triu_j_o)
 
         out = self.out_norm(out)
         out = self.post_ffn_norm(out + self.ffn(out))  # SwiGLU FFN + residual + norm
