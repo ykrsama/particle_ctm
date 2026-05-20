@@ -160,17 +160,15 @@ class CTMAttention(nn.Module):
         self.v_from_sync = nn.Linear(self.sync_size_qkv, embed_dim)
         self.o_from_sync = nn.Linear(self.sync_size_o, embed_dim)
 
-        # Feedback from previous tick's out into Q/K/V (zero-init no-ops)
-        # A: residual into the query/key/value inputs
+        # Feedback from previous tick's out into Q/K/V (zero-init no-op):
+        # residual into the query/key/value inputs. The QKV sync recurrence
+        # is intentionally not coupled directly to prev_out — only this
+        # embed-dim residual carries the O-pool signal, which then flows
+        # through pre_proj -> trace -> NLM -> sync like any other input.
         self.prev_to_q = nn.Linear(embed_dim, embed_dim)
         self.prev_to_k = nn.Linear(embed_dim, embed_dim)
         self.prev_to_v = nn.Linear(embed_dim, embed_dim)
-        # B: injection into the sync slice of activated (side-aware in _project_pool)
-        self.prev_to_sync_q = nn.Linear(embed_dim, n_synch_qkv)
-        self.prev_to_sync_k = nn.Linear(embed_dim, n_synch_qkv)
-        self.prev_to_sync_v = nn.Linear(embed_dim, n_synch_qkv)
-        for m in (self.prev_to_q, self.prev_to_k, self.prev_to_v,
-                  self.prev_to_sync_q, self.prev_to_sync_k, self.prev_to_sync_v):
+        for m in (self.prev_to_q, self.prev_to_k, self.prev_to_v):
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
 
@@ -316,40 +314,32 @@ class CTMAttention(nn.Module):
 
         if prev_out is not None:
             q_in = query + self.prev_to_q(prev_out)
-            inj_q = self.prev_to_sync_q(prev_out).reshape(B * L_q, self.n_synch_qkv)
         else:
             q_in = query
-            inj_q = None
 
         if prev_matches_kv:
             k_in = key + self.prev_to_k(prev_out)
             v_in = value + self.prev_to_v(prev_out)
-            inj_k = self.prev_to_sync_k(prev_out).reshape(B * L_kv, self.n_synch_qkv)
-            inj_v = self.prev_to_sync_v(prev_out).reshape(B * L_kv, self.n_synch_qkv)
         else:
             k_in, v_in = key, value
-            inj_k = inj_v = None
 
         Q, trace_q, alpha_q, beta_q = self._project_pool(
             q_in, self.pre_q, self.nlm_q, state['trace_q'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_q'], state['decay_beta_q'],
-            self.decay_params_q, self.q_from_sync,
-            inject_to_sync=inj_q)
+            self.decay_params_q, self.q_from_sync)
 
         K, trace_k, alpha_k, beta_k = self._project_pool(
             k_in, self.pre_k, self.nlm_k, state['trace_k'],
             self.n_synch_qkv, 'first',
             state['decay_alpha_k'], state['decay_beta_k'],
-            self.decay_params_k, self.k_from_sync,
-            inject_to_sync=inj_k)
+            self.decay_params_k, self.k_from_sync)
 
         V, trace_v, alpha_v, beta_v = self._project_pool(
             v_in, self.pre_v, self.nlm_v, state['trace_v'],
             self.n_synch_qkv, 'last',
             state['decay_alpha_v'], state['decay_beta_v'],
-            self.decay_params_v, self.v_from_sync,
-            inject_to_sync=inj_v)
+            self.decay_params_v, self.v_from_sync)
 
         # Multi-head split: (B, L, embed_dim) -> (B, num_heads, L, head_dim)
         def split_heads(t, L):
