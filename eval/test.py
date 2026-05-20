@@ -525,7 +525,7 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
         batch_size=batch_size,
         num_workers=max(1, cfg['data']['num_workers']),
         max_num_particles=cfg['data']['max_num_particles'],
-        shuffle=False,
+        shuffle=True,
         rank=0, world_size=1, seed=cfg['train']['seed'],
     )
 
