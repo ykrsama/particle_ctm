@@ -227,6 +227,7 @@ def train_worker(cfg):
     shuffle_buf = cfg['data'].get('shuffle_buffer_size', 20000)
     num_concurrent = cfg['data'].get('num_concurrent_files', 10)
     rows_per_visit = cfg['data'].get('rows_per_file_visit', 10000)
+    train_shard_by_rows = cfg['data'].get('train_shard_by_rows', True)
     train_loader = build_dataloader(
         cfg['data']['train_glob'],
         batch_size=cfg['train']['batch_size'],
@@ -237,6 +238,7 @@ def train_worker(cfg):
         shuffle_buffer_size=shuffle_buf,
         num_concurrent_files=num_concurrent,
         rows_per_file_visit=rows_per_visit,
+        shard_by_rows=train_shard_by_rows,
     )
     val_loader = build_dataloader(
         cfg['data']['val_glob'],
