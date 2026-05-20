@@ -133,7 +133,8 @@ def run_inference(model, loader, device, num_classes,
     Returns:
         all_preds_softmax: (N_total, C) per-jet predicted probs at most-certain tick
         all_targets:       (N_total,)
-        cert_above_per_tick: (T,) count of (jet, tick) where certainty > threshold
+        cert_above_per_tick: (C, T) count of (jet, tick) where certainty > threshold,
+                             broken down by true class.
         per_class_samples: dict[class_idx → list of {x_feat, x_vec, mask, target}]
                            one or more per class for the particle-cloud plot.
     """
@@ -171,8 +172,9 @@ def run_inference(model, loader, device, num_classes,
         pbar.set_postfix(n=n_seen, acc=f'{n_correct / max(n_seen, 1):.4f}')
 
         if cert_above is None:
-            cert_above = torch.zeros(preds.size(-1), dtype=torch.long)
-        cert_above += (certs[:, 1] > certainty_threshold).sum(dim=0).cpu()
+            cert_above = torch.zeros(num_classes, preds.size(-1), dtype=torch.long)
+        above = (certs[:, 1] > certainty_threshold).long().cpu()
+        cert_above.index_add_(0, y.cpu(), above)
 
         # Stash a few raw samples per class for the particle-cloud plot.
         for cls in range(num_classes):
@@ -260,13 +262,20 @@ def plot_confusion(probs, targets, out_path, class_names):
     plt.close()
 
 
-def plot_certainty_histogram(cert_above_per_tick, out_path, threshold=0.8):
-    T = len(cert_above_per_tick)
+def plot_certainty_histogram(cert_above_per_class, out_path, class_names, threshold=0.8):
+    cert_above_per_class = np.asarray(cert_above_per_class)
+    C, T = cert_above_per_class.shape
+    ticks = np.arange(T)
     plt.figure(figsize=(9, 4))
-    plt.bar(np.arange(T), cert_above_per_tick, color='steelblue', alpha=0.85)
+    bottom = np.zeros(T, dtype=cert_above_per_class.dtype)
+    for c in range(C):
+        plt.bar(ticks, cert_above_per_class[c], bottom=bottom,
+                color=f'C{c}', alpha=0.85, label=class_names[c])
+        bottom = bottom + cert_above_per_class[c]
     plt.xlabel('tick')
     plt.ylabel(f'# jets with certainty > {threshold}')
-    plt.title(f'Confidence (>{threshold}) distribution across CTM ticks')
+    plt.title(f'Certainty (>{threshold}) distribution across CTM ticks')
+    plt.legend(loc='upper right', fontsize=7, ncol=2)
     plt.grid(alpha=0.3, axis='y')
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
@@ -578,7 +587,7 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
     plot_prc(probs, targets,        os.path.join(output_dir, 'prc.png'),               CLASS_NAMES)
     plot_confusion(probs, targets,  os.path.join(output_dir, 'confusion_matrix.png'),  CLASS_NAMES)
     plot_certainty_histogram(cert_above, os.path.join(output_dir, 'certainty_vs_tick.png'),
-                             threshold=certainty_threshold)
+                             CLASS_NAMES, threshold=certainty_threshold)
     try:
         plot_particle_clouds(test_glob, NUM_CLASSES,
                              os.path.join(output_dir, 'particle_clouds.png'),
