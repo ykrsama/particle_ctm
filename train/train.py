@@ -74,11 +74,6 @@ def _small_param_log(base_model, step):
 
     for i, v in enumerate(ca.c_attn.detach().float().cpu().tolist()):
         out[f'params/c_attn/h{i}'] = v
-    log_tau = ca.log_tau.detach().float().cpu()
-    for i in range(log_tau.numel()):
-        lt = float(log_tau[i])
-        out[f'params/log_tau/h{i}'] = lt
-        out[f'params/tau/h{i}'] = float(log_tau[i].exp())
 
     for name in ('decay_params_q', 'decay_params_k',
                  'decay_params_v', 'decay_params_o'):

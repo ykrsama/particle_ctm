@@ -210,9 +210,6 @@ class CTMAttention(nn.Module):
 
         # ParT-style per-head output scaling; ones-init => no-op at start.
         self.c_attn = nn.Parameter(torch.ones(num_heads))
-        # Per-head learnable softmax temperature; zeros-init => exp(0)=1, so
-        # the effective scale matches the previous 1/sqrt(d_head).
-        self.log_tau = nn.Parameter(torch.zeros(num_heads))
         # Q/K-norm along head_dim to stabilise logit scale across CTM ticks.
         self.q_norm = nn.LayerNorm(self.head_dim)
         self.k_norm = nn.LayerNorm(self.head_dim)
@@ -395,9 +392,9 @@ class CTMAttention(nn.Module):
                     merged_mask = merged_mask.unsqueeze(0).unsqueeze(0)
                 merged_mask = merged_mask + kp_add
 
-        # Scaled dot-product attention; per-head learnable temperature on logits.
-        per_head_scale = torch.exp(self.log_tau).view(1, -1, 1, 1) / math.sqrt(self.head_dim)
-        attn_logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * per_head_scale  # (B, H, L_q, L_kv)
+        # Scaled dot-product attention.
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * scale  # (B, H, L_q, L_kv)
         if merged_mask is not None:
             attn_logits = attn_logits + merged_mask
         attn_weights = F.softmax(attn_logits, dim=-1)
