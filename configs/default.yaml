@@ -37,7 +37,7 @@ model:
   pair_input_dim: 4
   pair_extra_dim: 0
   embed_dims: [128, 512, 128]
-  pair_embed_dims: [64, 64]
+  pair_embed_dims: [64, 64, 64]
   use_pre_activation_pair: false
   num_heads: 8
   iterations: 45
