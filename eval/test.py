@@ -96,16 +96,38 @@ def load_checkpoint(model, ckpt_path, device):
     state = ckpt['model_state_dict']
     # Strip DDP "module." prefix if present.
     state = {k.replace('module.', '', 1): v for k, v in state.items()}
-    model.load_state_dict(state)
+    # strict=False so checkpoints saved before architectural pruning (e.g.
+    # removed `prev_to_sync_q/k/v` after commit cb42bec) still load. Surface
+    # missing/unexpected keys so silent drift remains visible.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f'[test] missing keys ({len(missing)}): {missing}')
+    if unexpected:
+        print(f'[test] unexpected keys ({len(unexpected)}): {unexpected}')
     return ckpt
 
 
 # ---------------------------------------------------------------------------
 # Inference: collect predictions, certainties, raw samples for plots
 # ---------------------------------------------------------------------------
+def count_total_batches(test_glob, batch_size):
+    """Cheaply sum entries across all test ROOT files (num_entries is a header
+    read, no array decoding). Returns floor(total_entries / batch_size) to
+    match the DataLoader's drop_last=True."""
+    import glob as _glob
+    import uproot
+    files = sorted(_glob.glob(test_glob))
+    total = 0
+    for fp in files:
+        with uproot.open(fp) as f:
+            total += int(f['tree'].num_entries)
+    return total // batch_size, total
+
+
 @torch.inference_mode()
 def run_inference(model, loader, device, num_classes,
-                  certainty_threshold=0.8, viz_per_class=1, max_batches=None):
+                  certainty_threshold=0.8, viz_per_class=1, max_batches=None,
+                  total_batches=None):
     """Single sweep through the test loader.
 
     Returns:
@@ -120,8 +142,16 @@ def run_inference(model, loader, device, num_classes,
     cert_above = None  # filled after we see T from the first batch
     per_class_samples = defaultdict(list)
     n_batches = 0
+    n_seen = 0
+    n_correct = 0
 
-    for x_feat, x_vec, mask, y in tqdm(loader, desc='infer', dynamic_ncols=True):
+    if max_batches is not None and total_batches is not None:
+        total_batches = min(total_batches, max_batches)
+    elif max_batches is not None:
+        total_batches = max_batches
+    pbar = tqdm(loader, desc='infer', dynamic_ncols=True, unit='batch',
+                total=total_batches)
+    for x_feat, x_vec, mask, y in pbar:
         x_feat = x_feat.to(device, non_blocking=True)
         x_vec = x_vec.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -134,6 +164,11 @@ def run_inference(model, loader, device, num_classes,
         probs = F.softmax(logits, dim=-1).cpu().numpy()
         all_preds.append(probs)
         all_tgts.append(y.numpy())
+
+        y_np = y.numpy()
+        n_seen += y_np.shape[0]
+        n_correct += int((probs.argmax(axis=1) == y_np).sum())
+        pbar.set_postfix(n=n_seen, acc=f'{n_correct / max(n_seen, 1):.4f}')
 
         if cert_above is None:
             cert_above = torch.zeros(preds.size(-1), dtype=torch.long)
@@ -470,7 +505,8 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
 # Entrypoint
 # ---------------------------------------------------------------------------
 def run_test(cfg, ckpt_path, output_dir, device=None,
-             max_batches=None, certainty_threshold=0.8, viz_per_class=1):
+             max_batches=None, certainty_threshold=0.8, viz_per_class=1,
+             batch_size=1024):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(output_dir, exist_ok=True)
@@ -486,18 +522,27 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
     test_glob = cfg['data']['test_glob']
     test_loader = build_dataloader(
         test_glob,
-        batch_size=cfg['train']['batch_size'],
+        batch_size=batch_size,
         num_workers=max(1, cfg['data']['num_workers']),
         max_num_particles=cfg['data']['max_num_particles'],
         shuffle=False,
         rank=0, world_size=1, seed=cfg['train']['seed'],
     )
 
+    try:
+        total_batches, total_entries = count_total_batches(test_glob, batch_size)
+        print(f'[test] eval set: {total_entries} jets -> {total_batches} batches '
+              f'@ batch_size={batch_size} (drop_last=True)')
+    except Exception as e:
+        print(f'[test] could not pre-count entries ({e}); progress bar will be untotaled')
+        total_batches = None
+
     probs, targets, cert_above, per_class_samples = run_inference(
         model, test_loader, device, NUM_CLASSES,
         certainty_threshold=certainty_threshold,
         viz_per_class=viz_per_class,
         max_batches=max_batches,
+        total_batches=total_batches,
     )
 
     # Metrics
@@ -563,6 +608,8 @@ def main():
                              '<run_dir>/test.')
     parser.add_argument('--max-batches', type=int, default=None,
                         help='Cap eval to N batches (debugging).')
+    parser.add_argument('--batch-size', type=int, default=4096,
+                        help='Eval batch size (overrides cfg.train.batch_size).')
     parser.add_argument('--certainty-threshold', type=float, default=0.8)
     parser.add_argument('--viz-per-class', type=int, default=1,
                         help='Raw jets per class to stash for viz module.')
@@ -606,7 +653,8 @@ def main():
     run_test(cfg, ckpt_path, output_dir,
              max_batches=args.max_batches,
              certainty_threshold=args.certainty_threshold,
-             viz_per_class=args.viz_per_class)
+             viz_per_class=args.viz_per_class,
+             batch_size=args.batch_size)
 
 
 if __name__ == '__main__':
