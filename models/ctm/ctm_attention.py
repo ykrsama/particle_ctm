@@ -198,6 +198,15 @@ class CTMAttention(nn.Module):
         self.decay_params_v = nn.Parameter(torch.zeros(self.sync_size_qkv))
         self.decay_params_o = nn.Parameter(torch.zeros(self.sync_size_o))
 
+        # ParT-style per-head output scaling; ones-init => no-op at start.
+        self.c_attn = nn.Parameter(torch.ones(num_heads))
+        # Per-head learnable softmax temperature; zeros-init => exp(0)=1, so
+        # the effective scale matches the previous 1/sqrt(d_head).
+        self.log_tau = nn.Parameter(torch.zeros(num_heads))
+        # Q/K-norm along head_dim to stabilise logit scale across CTM ticks.
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+
     def _register_start_trace(self, name, n_neurons):
         bound = math.sqrt(1.0 / (n_neurons + self.memory_length))
         trace = torch.empty(n_neurons, self.memory_length).uniform_(-bound, bound)
@@ -349,6 +358,10 @@ class CTMAttention(nn.Module):
         Kh = split_heads(K, L_kv)
         Vh = split_heads(V, L_kv)
 
+        # QK-norm along head_dim — keeps logit scale stable across ticks.
+        Qh = self.q_norm(Qh)
+        Kh = self.k_norm(Kh)
+
         # Build additive float mask combining attn_mask and key_padding_mask
         merged_mask = None
         if attn_mask is not None:
@@ -368,14 +381,16 @@ class CTMAttention(nn.Module):
                     merged_mask = merged_mask.unsqueeze(0).unsqueeze(0)
                 merged_mask = merged_mask + kp_add
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * scale  # (B, H, L_q, L_kv)
+        # Scaled dot-product attention; per-head learnable temperature on logits.
+        per_head_scale = torch.exp(self.log_tau).view(1, -1, 1, 1) / math.sqrt(self.head_dim)
+        attn_logits = torch.matmul(Qh, Kh.transpose(-2, -1)) * per_head_scale  # (B, H, L_q, L_kv)
         if merged_mask is not None:
             attn_logits = attn_logits + merged_mask
         attn_weights = F.softmax(attn_logits, dim=-1)
         attn_dropped = F.dropout(attn_weights, p=self.dropout_p, training=self.training)
         attn_out = torch.matmul(attn_dropped, Vh)  # (B, H, L_q, head_dim)
+        # ParT-style per-head output scaling, applied before merging heads.
+        attn_out = attn_out * self.c_attn.view(1, -1, 1, 1)
         attn_out = attn_out.transpose(1, 2).reshape(B, L_q, self.embed_dim)
 
         # Output pool: attn_out enters via O-pool's NLM+Sync only — no

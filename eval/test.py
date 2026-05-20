@@ -392,7 +392,9 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
         energy = np.clip(s['energy'][m], a_min=1e-3, a_max=None)
         sizes = 6 + 90 * (energy / max(energy.max(), 1e-3))
         disp = np.sqrt(s['d0val'][m] ** 2 + s['dzval'][m] ** 2)
-        colors = cmap(np.clip(disp / disp_max, 0, 1))
+        # Remap into [0.35, 1.0] of the colormap so even zero-displacement
+        # particles render with a clearly visible (non-near-white) color.
+        colors = cmap(0.35 + 0.65 * np.clip(disp / disp_max, 0, 1))
 
         # 5 categories: charged hadron, neutral hadron, electron, muon, photon, other
         ch = s['isChargedHadron'][m].astype(bool)
