@@ -66,14 +66,15 @@ def _small_param_log(base_model, step):
 
     Covers per-head scalars (c_attn, log_tau / tau), sync-decay distributions
     (decay_params_{q,k,v,o} as histograms + mean/std), QK-norm affine weights,
-    and the cls_token. Cheap — runs at log_every cadence on rank 0 only.
+    w_resid, and the cls_token. Cheap — runs at log_every cadence on rank 0 only.
     """
     import wandb as _wandb
     ca = base_model.ctm_attention
     out = {'step': step}
 
-    for i, v in enumerate(ca.c_attn.detach().float().cpu().tolist()):
-        out[f'params/c_attn/h{i}'] = v
+    if getattr(ca, 'c_attn', None) is not None:
+        for i, v in enumerate(ca.c_attn.detach().float().cpu().tolist()):
+            out[f'params/c_attn/h{i}'] = v
 
     for name in ('decay_params_q', 'decay_params_k',
                  'decay_params_v', 'decay_params_o'):
@@ -83,10 +84,18 @@ def _small_param_log(base_model, step):
         out[f'params/{name}/std'] = float(t.std())
 
     for name in ('q_norm', 'k_norm'):
-        w = getattr(ca, name).weight.detach().float().cpu()
-        out[f'params/{name}/mean'] = float(w.mean())
-        out[f'params/{name}/std'] = float(w.std())
-        out[f'params/{name}/norm'] = float(w.norm())
+        norm_layer = getattr(ca, name, None)
+        if norm_layer is not None:
+            w = norm_layer.weight.detach().float().cpu()
+            out[f'params/{name}/mean'] = float(w.mean())
+            out[f'params/{name}/std'] = float(w.std())
+            out[f'params/{name}/norm'] = float(w.norm())
+
+    if getattr(ca, 'w_resid', None) is not None:
+        w_r = ca.w_resid.detach().float().cpu()
+        out['params/w_resid/mean'] = float(w_r.mean())
+        out['params/w_resid/std'] = float(w_r.std())
+        out['params/w_resid/norm'] = float(w_r.norm())
 
     cls = base_model.cls_token.detach().float().cpu().flatten()
     out['params/cls_token/norm'] = float(cls.norm())
@@ -219,6 +228,9 @@ def train_worker(cfg):
         n_synch_qkv=mcfg['n_synch_qkv'],
         n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
+        qk_norm=mcfg.get('qk_norm', False),
+        scale_head=mcfg.get('scale_head', True),
+        scale_resid=mcfg.get('scale_resid', True),
         trim=mcfg['trim'],
         fc_params=tuple(tuple(x) for x in mcfg['fc_params']),
         activation=mcfg['activation'],

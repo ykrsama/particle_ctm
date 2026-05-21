@@ -119,7 +119,10 @@ class CTMAttention(nn.Module):
                  n_synch_qkv=32,
                  n_synch_o=32,
                  dropout=0.0,
-                 ffn_dim=None):
+                 ffn_dim=None,
+                 qk_norm=False,
+                 scale_head=True,
+                 scale_resid=True):
         super().__init__()
 
         if embed_dim % num_heads != 0:
@@ -209,10 +212,11 @@ class CTMAttention(nn.Module):
         self.register_buffer('triu_j_o', triu_o[1], persistent=False)
 
         # ParT-style per-head output scaling; ones-init => no-op at start.
-        self.c_attn = nn.Parameter(torch.ones(num_heads))
+        self.c_attn = nn.Parameter(torch.ones(num_heads)) if scale_head else None
         # Q/K-norm along head_dim to stabilise logit scale across CTM ticks.
-        self.q_norm = nn.LayerNorm(self.head_dim)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.q_norm = nn.LayerNorm(self.head_dim) if qk_norm else None
+        self.k_norm = nn.LayerNorm(self.head_dim) if qk_norm else None
+        self.w_resid = nn.Parameter(torch.ones(embed_dim)) if scale_resid else None
 
     def _register_start_trace(self, name, n_neurons):
         bound = math.sqrt(1.0 / (n_neurons + self.memory_length))
@@ -370,8 +374,10 @@ class CTMAttention(nn.Module):
         Vh = split_heads(V, L_kv)
 
         # QK-norm along head_dim — keeps logit scale stable across ticks.
-        Qh = self.q_norm(Qh)
-        Kh = self.k_norm(Kh)
+        if self.q_norm is not None:
+            Qh = self.q_norm(Qh)
+        if self.k_norm is not None:
+            Kh = self.k_norm(Kh)
 
         # Build additive float mask combining attn_mask and key_padding_mask
         merged_mask = None
@@ -401,7 +407,8 @@ class CTMAttention(nn.Module):
         attn_dropped = F.dropout(attn_weights, p=self.dropout_p, training=self.training)
         attn_out = torch.matmul(attn_dropped, Vh)  # (B, H, L_q, head_dim)
         # ParT-style per-head output scaling, applied before merging heads.
-        attn_out = attn_out * self.c_attn.view(1, -1, 1, 1)
+        if self.c_attn is not None:
+            attn_out = attn_out * self.c_attn.view(1, -1, 1, 1)
         attn_out = attn_out.transpose(1, 2).reshape(B, L_q, self.embed_dim)
 
         # Output pool: attn_out enters via O-pool's NLM+Sync only — no
@@ -415,7 +422,12 @@ class CTMAttention(nn.Module):
             self.triu_i_o, self.triu_j_o)
 
         out = self.out_norm(out)
-        out = self.post_ffn_norm(out + self.ffn(out))  # SwiGLU FFN + residual + norm
+        
+        residual = out
+        if self.w_resid is not None:
+            residual = torch.mul(self.w_resid, residual)
+            
+        out = self.post_ffn_norm(residual + self.ffn(out))  # SwiGLU FFN + residual + norm
 
         new_state = {
             'trace_q': trace_q, 'trace_k': trace_k,
