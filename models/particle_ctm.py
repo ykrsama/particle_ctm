@@ -73,6 +73,9 @@ class ParticleCTM(nn.Module):
                  n_synch_qkv=32,
                  n_synch_o=32,
                  dropout=0.0,
+                 qk_norm=False,
+                 scale_head=True,
+                 scale_resid=True,
                  # misc
                  trim=True,
                  fc_params=(),
@@ -107,6 +110,9 @@ class ParticleCTM(nn.Module):
             n_synch_qkv=n_synch_qkv,
             n_synch_o=n_synch_o,
             dropout=dropout,
+            qk_norm=qk_norm,
+            scale_head=scale_head,
+            scale_resid=scale_resid,
         )
         self.norm = nn.LayerNorm(embed_dim)
 
