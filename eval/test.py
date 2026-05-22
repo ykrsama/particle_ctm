@@ -563,12 +563,13 @@ def run_nlm_dynamics(model, per_class_samples, out_dir, device):
         plot_neural_dynamics_simple(
             stack,
             os.path.join(out_dir, f'nlm_dynamics_{name}.png'),
-            title=f'NLM post-activation — {name.upper()} pool (per-token overlay, sample 0)',
+            title=f'Post-activation neuron dynamics - {name.upper()} pool (per-token overlay, sample 0)',
         )
 
     return {
         'preds': preds, 'certs': certs, 'targets': targets,
         'attn_stack': attn_stack, 'saliency': saliency, 'viz_mask': viz_mask,
+        'x_feat': x_feat.detach().cpu().numpy(), 'P_trimmed': P_trimmed,
     }
 
 
@@ -577,15 +578,18 @@ def run_saliency_gif(payload, out_dir):
     if payload is None:
         return
     from particle_ctm.utils.visualization import make_saliency_gif
+    P_trimmed = payload['P_trimmed']
+    # Sample 0, channels × trimmed particles, to match attention/saliency shape.
+    x_feat_sample = payload['x_feat'][0][:, :P_trimmed]
     make_saliency_gif(
         payload['preds'], payload['certs'], payload['targets'],
         attention_per_tick=payload['attn_stack'][:, 0],
         saliency=payload['saliency'][:, 0],
         masks=payload['viz_mask'],
+        x_feat=x_feat_sample,
         class_names=CLASS_NAMES,
         out_path=os.path.join(out_dir, 'saliency.gif'),
         batch_index=0,
-        top_k_particles=20,
     )
 
 
@@ -677,16 +681,16 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
         print(f'[test] nlm dynamics failed: {e}')
 
     try:
-        plot_particle_clouds(test_glob, NUM_CLASSES,
-                             os.path.join(output_dir, 'particle_clouds.png'),
-                             max_num_particles=cfg['data']['max_num_particles'])
-    except Exception as e:
-        print(f'[test] particle_clouds failed: {e}')
-
-    try:
         run_saliency_gif(viz_payload, output_dir)
     except Exception as e:
         print(f'[test] saliency gif failed: {e}')
+
+    #try:
+    #    plot_particle_clouds(test_glob, NUM_CLASSES,
+    #                         os.path.join(output_dir, 'particle_clouds.png'),
+    #                         max_num_particles=cfg['data']['max_num_particles'])
+    #except Exception as e:
+    #    print(f'[test] particle_clouds failed: {e}')
 
     print(f'[test] outputs written to {output_dir}')
     return metrics
