@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import seaborn as sns
 import imageio
 from scipy.special import softmax
@@ -49,6 +50,13 @@ def _draw_particle_cloud(ax, deta, dphi, pid_flags, *, sizes, colors=None,
         colors:    (N, 4) RGBA array, or None for neutral dimgray.
         alpha:     scalar or (N,) array; if (N,) array, baked into the RGBA.
         edge_linewidth: outline thickness.
+
+    Returns:
+        dict[str, dict] mapping PID group key to {
+            'collection': PathCollection returned by ax.scatter,
+            'mask': bool (N,) selection mask for this group,
+            'fill': 'full' or 'none' (does the group respect facecolor?),
+        }. Keys present only for groups that contained at least one particle.
     """
     N = len(deta)
     if colors is None:
@@ -72,25 +80,28 @@ def _draw_particle_cloud(ax, deta, dphi, pid_flags, *, sizes, colors=None,
     other = ~(ch | nh | ee | mu | ph)
 
     groups = [
-        (ch, 'o', 'full'),
-        (nh, 'o', 'none'),
-        (ee, 'v', 'full'),
-        (mu, '^', 'full'),
-        (ph, 'p', 'none'),
-        (other, 'x', 'full'),
+        ('ch',    ch,    'o', 'full'),
+        ('nh',    nh,    'o', 'none'),
+        ('e',     ee,    'v', 'full'),
+        ('mu',    mu,    '^', 'full'),
+        ('ph',    ph,    'p', 'none'),
+        ('other', other, 'x', 'full'),
     ]
-    for sel, marker, fill in groups:
+    handles = {}
+    for key, sel, marker, fill in groups:
         if not sel.any():
             continue
         sel_colors = rgba[sel]
         if fill == 'none':
-            ax.scatter(deta[sel], dphi[sel], s=sizes[sel],
-                       marker=marker, facecolors='none',
-                       edgecolors=sel_colors, linewidths=edge_linewidth)
+            sc = ax.scatter(deta[sel], dphi[sel], s=sizes[sel],
+                            marker=marker, facecolors='none',
+                            edgecolors=sel_colors, linewidths=edge_linewidth)
         else:
-            ax.scatter(deta[sel], dphi[sel], s=sizes[sel],
-                       marker=marker, facecolors=sel_colors,
-                       edgecolors=sel_colors, linewidths=edge_linewidth)
+            sc = ax.scatter(deta[sel], dphi[sel], s=sizes[sel],
+                            marker=marker, facecolors=sel_colors,
+                            edgecolors=sel_colors, linewidths=edge_linewidth)
+        handles[key] = {'collection': sc, 'mask': sel, 'fill': fill}
+    return handles
 
 
 def compute_cls_saliency(model, x_feat, x_vec, mask):
@@ -193,10 +204,14 @@ def make_saliency_gif(predictions, certainties, targets,
     attn_for_argmax[:, :, pad_mask] = -np.inf
     focus_idx = attn_for_argmax.argmax(axis=-1)  # (T, H)
 
-    # Color normalisation for the right panel.
+    # Shared color scale across both bottom panels. Includes both per-particle
+    # attention (right panel) and per-head focus-particle attention (left arrows).
     attn_real = attn_smooth[:, real_idx]
-    attn_vmin = float(attn_real.min()) if attn_real.size else 0.0
-    attn_vmax = float(attn_real.max()) if attn_real.size else 1.0
+    focus_attn_all = np.take_along_axis(
+        attn_per_head_smooth, focus_idx[:, :, None], axis=-1).squeeze(-1)  # (T, H)
+    pool_for_scale = np.concatenate([attn_real.ravel(), focus_attn_all.ravel()])
+    attn_vmin = float(pool_for_scale.min()) if pool_for_scale.size else 0.0
+    attn_vmax = float(pool_for_scale.max()) if pool_for_scale.size else 1.0
     if attn_vmax - attn_vmin < 1e-12:
         attn_vmax = attn_vmin + 1e-12
 
@@ -207,7 +222,7 @@ def make_saliency_gif(predictions, certainties, targets,
           f'out={out_path}')
     print(f'[plot] saliency_gif: smooth_window={smooth_window}, '
           f'max_heads={n_heads_show}, arrows@last_frame={n_arrows_final}, '
-          f'attention range [{attn_vmin:.3g}, {attn_vmax:.3g}]')
+          f'shared attention range [{attn_vmin:.3g}, {attn_vmax:.3g}]')
 
     # Marker size + alpha from pt_log: standardised range is roughly [-3, 3].
     pt_norm = np.clip((pt_log + 3.0) / 6.0, 0.0, 1.0)
@@ -223,108 +238,150 @@ def make_saliency_gif(predictions, certainties, targets,
         lim = 0.5
 
     cmap_attn = sns.color_palette('viridis', as_cmap=True)
-    cmap_time = sns.color_palette('Spectral', as_cmap=True)
-    step_linspace = np.linspace(0, 1, max(T, 2))
-    arrow_scale = lim  # head_width/length expressed relative to axis range
-    head_width = 0.035 * arrow_scale
-    head_length = 0.045 * arrow_scale
-    frames = []
+    attn_norm_obj = plt.Normalize(vmin=attn_vmin, vmax=attn_vmax)
 
-    # Real-particle slice cache (used identically by both bottom panels).
+    # Precompute per-tick rgba arrays.
+    attn_smooth_norm = np.clip((attn_smooth[:, real_idx] - attn_vmin) /
+                               (attn_vmax - attn_vmin), 0.0, 1.0)
+    right_rgba_per_tick = cmap_attn(attn_smooth_norm)  # (T, n_real, 4)
+
+    # Arrow segments + colors, accumulated as we walk ticks.
+    focus_attn_norm = np.clip((focus_attn_all - attn_vmin) /
+                              (attn_vmax - attn_vmin), 0.0, 1.0)
+    arrow_rgba_full = cmap_attn(focus_attn_norm)  # (T, H, 4)
+
     pid_real = {k: v[real_idx] for k, v in pid_flags.items()}
     deta_real = deta[real_idx]
     dphi_real = dphi[real_idx]
     sizes_real = sizes_all[real_idx]
     alpha_real = alpha_all[real_idx]
 
+    # ---- Build figure once. ----
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9),
+                             gridspec_kw={'height_ratios': [1, 1.3]})
+
+    # Top-left: class probabilities (bars updated per tick, axes static).
+    bar_colors = ['g' if i == this_target else 'b' for i in range(num_classes)]
+    bars = axes[0, 0].bar(np.arange(num_classes), np.zeros(num_classes),
+                          color=bar_colors, alpha=0.6)
+    axes[0, 0].set_xticks(np.arange(num_classes))
+    axes[0, 0].set_xticklabels(short_labels, rotation=45, ha='right', fontsize=8)
+    axes[0, 0].set_ylim([0, 1])
+    title_probs = axes[0, 0].set_title(f'Class probs (tick 0/{T-1})')
+
+    # Top-right: certainty curve + moveable cursor.
+    axes[0, 1].plot(np.arange(T), these_certainties[1], 'k-', lw=2)
+    vline = axes[0, 1].axvline(0, color='red', alpha=0.5)
+    axes[0, 1].set_title('Certainty (1 - normalised entropy)')
+    axes[0, 1].set_xlim([0, T - 1])
+    axes[0, 1].set_ylim([0, 1])
+
+    # Bottom-left: particle cloud underlay + arrow LineCollections.
+    axL = axes[1, 0]
+    _draw_particle_cloud(axL, deta_real, dphi_real, pid_real,
+                         sizes=sizes_real, colors=None, alpha=alpha_real,
+                         edge_linewidth=0.6)
+    lc_halo = LineCollection([], colors='white', linewidths=2.6, alpha=0.95,
+                             zorder=3)
+    lc_color = LineCollection([], colors=[], linewidths=1.4, alpha=0.95,
+                              zorder=4)
+    axL.add_collection(lc_halo)
+    axL.add_collection(lc_color)
+    axL.set_xlim(-lim, lim); axL.set_ylim(-lim, lim)
+    axL.set_aspect('equal')
+    axL.set_xlabel(r'$\Delta\eta$', fontsize=9)
+    axL.set_ylabel(r'$\Delta\varphi$', fontsize=9)
+    title_left = axL.set_title(f'cls attention tracks (tick 0, heads={n_heads_show})')
+    axL.grid(alpha=0.2)
+    sm_L = plt.cm.ScalarMappable(cmap=cmap_attn, norm=attn_norm_obj)
+    sm_L.set_array([])
+    fig.colorbar(sm_L, ax=axL, fraction=0.046, pad=0.04,
+                 label='cls→particle attention')
+
+    # Bottom-right: particle cloud whose facecolors are updated per tick.
+    axR = axes[1, 1]
+    initial_rgba = right_rgba_per_tick[0]
+    right_handles = _draw_particle_cloud(
+        axR, deta_real, dphi_real, pid_real,
+        sizes=sizes_real, colors=initial_rgba, alpha=alpha_real,
+        edge_linewidth=0.6)
+    axR.set_xlim(-lim, lim); axR.set_ylim(-lim, lim)
+    axR.set_aspect('equal')
+    axR.set_xlabel(r'$\Delta\eta$', fontsize=9)
+    axR.set_ylabel(r'$\Delta\varphi$', fontsize=9)
+    title_right = axR.set_title(f'cls→particle attention (tick 0, mean over heads)')
+    axR.grid(alpha=0.2)
+    sm_R = plt.cm.ScalarMappable(cmap=cmap_attn, norm=attn_norm_obj)
+    sm_R.set_array([])
+    fig.colorbar(sm_R, ax=axR, fraction=0.046, pad=0.04,
+                 label='cls→particle attention')
+
+    fig.suptitle(f'ground truth: {class_names[this_target]}  '
+                 f'(shape=PID, fill=charge, size/α ∝ pt)', fontsize=11)
+    fig.tight_layout()
+
+    # ---- Per-tick artist updates only. ----
+    accum_segments = []
+    accum_colors = []
+    frames = []
+
+    def _update_right_colors(rgba_all):
+        # rgba_all is (n_real, 4). For each PID group handle, slice by its mask
+        # (which is N-shaped) -> then index into rgba_all (which is n_real-shaped)
+        # via the same group mask but applied within real indices.
+        # The handles dict was built from pid_real flags (already n_real-shaped),
+        # so the stored 'mask' is n_real-aligned.
+        for grp in right_handles.values():
+            sel = grp['mask']
+            sub = rgba_all[sel]
+            coll = grp['collection']
+            if grp['fill'] == 'none':
+                # Hollow markers: only edgecolor encodes color; keep face='none'.
+                coll.set_edgecolors(sub)
+            else:
+                coll.set_facecolors(sub)
+                coll.set_edgecolors(sub)
+
     for t in tqdm(range(T), desc='Saliency frames'):
-        fig, axes = plt.subplots(2, 2, figsize=(12, 9),
-                                 gridspec_kw={'height_ratios': [1, 1.3]})
-
-        # Class probabilities
+        # Probabilities
         probs = softmax(these_predictions[:, t])
-        colors = ['g' if i == this_target else 'b' for i in range(num_classes)]
-        axes[0, 0].bar(np.arange(num_classes), probs, color=colors, alpha=0.6)
-        axes[0, 0].set_xticks(np.arange(num_classes))
-        axes[0, 0].set_xticklabels(short_labels, rotation=45, ha='right', fontsize=8)
-        axes[0, 0].set_ylim([0, 1])
-        axes[0, 0].set_title(f'Class probs (tick {t}/{T-1})')
+        for rect, h in zip(bars.patches, probs):
+            rect.set_height(float(h))
+        title_probs.set_text(f'Class probs (tick {t}/{T-1})')
 
-        # Certainty curve
-        axes[0, 1].plot(np.arange(T), these_certainties[1], 'k-', lw=2)
-        axes[0, 1].axvline(t, color='red', alpha=0.5)
-        axes[0, 1].set_title('Certainty (1 - normalised entropy)')
-        axes[0, 1].set_xlim([0, T - 1])
-        axes[0, 1].set_ylim([0, 1])
+        # Certainty cursor
+        vline.set_xdata([t, t])
 
-        # Bottom-left: particle cloud + cumulative per-head focus arrows.
-        ax = axes[1, 0]
-        _draw_particle_cloud(ax, deta_real, dphi_real, pid_real,
-                             sizes=sizes_real, colors=None, alpha=alpha_real,
-                             edge_linewidth=0.6)
-        for h in range(n_heads_show):
-            for tt in range(t):
+        # Arrow accumulation: add new segments for tt = t-1 -> t (none on t==0).
+        if t > 0:
+            tt = t - 1
+            for h in range(n_heads_show):
                 p_prev = focus_idx[tt, h]
                 p_curr = focus_idx[tt + 1, h]
-                x0, y0 = deta[p_prev], dphi[p_prev]
-                dx = deta[p_curr] - x0
-                dy = dphi[p_curr] - y0
-                if dx == 0 and dy == 0:
+                x0, y0 = float(deta[p_prev]), float(dphi[p_prev])
+                x1, y1 = float(deta[p_curr]), float(dphi[p_curr])
+                if x0 == x1 and y0 == y1:
                     continue
-                colr = cmap_time(step_linspace[tt])
-                # white halo
-                ax.arrow(x0, y0, dx, dy,
-                         linewidth=2.2, head_width=head_width * 1.25,
-                         head_length=head_length * 1.25,
-                         fc='white', ec='white',
-                         length_includes_head=True, alpha=0.95)
-                # colored stroke
-                ax.arrow(x0, y0, dx, dy,
-                         linewidth=1.2, head_width=head_width,
-                         head_length=head_length,
-                         fc=colr, ec=colr,
-                         length_includes_head=True, alpha=0.95)
-        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-        ax.set_aspect('equal')
-        ax.set_xlabel(r'$\Delta\eta$', fontsize=9)
-        ax.set_ylabel(r'$\Delta\varphi$', fontsize=9)
-        ax.set_title(f'cls attention tracks (tick {t}, heads={n_heads_show})')
-        ax.grid(alpha=0.2)
-        # Tick→color reference bar.
-        sm_time = plt.cm.ScalarMappable(cmap=cmap_time,
-                                        norm=plt.Normalize(vmin=0, vmax=max(T - 1, 1)))
-        sm_time.set_array([])
-        cbar_t = fig.colorbar(sm_time, ax=ax, fraction=0.046, pad=0.04)
-        cbar_t.set_label('tick', fontsize=8)
+                accum_segments.append([(x0, y0), (x1, y1)])
+                accum_colors.append(arrow_rgba_full[tt, h])
+        lc_halo.set_segments(accum_segments)
+        lc_color.set_segments(accum_segments)
+        if accum_colors:
+            lc_color.set_colors(accum_colors)
+        title_left.set_text(
+            f'cls attention tracks (tick {t}, heads={n_heads_show}, '
+            f'arrows={len(accum_segments)})')
 
-        # Bottom-right: particle cloud colored by mean-over-heads attention.
-        ax = axes[1, 1]
-        attn_t = attn_smooth[t][real_idx]
-        norm_t = (attn_t - attn_vmin) / (attn_vmax - attn_vmin)
-        norm_t = np.clip(norm_t, 0.0, 1.0)
-        rgba_t = cmap_attn(norm_t)
-        _draw_particle_cloud(ax, deta_real, dphi_real, pid_real,
-                             sizes=sizes_real, colors=rgba_t, alpha=alpha_real,
-                             edge_linewidth=0.6)
-        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
-        ax.set_aspect('equal')
-        ax.set_xlabel(r'$\Delta\eta$', fontsize=9)
-        ax.set_ylabel(r'$\Delta\varphi$', fontsize=9)
-        ax.set_title(f'cls→particle attention (tick {t}, mean over heads)')
-        ax.grid(alpha=0.2)
-        sm_a = plt.cm.ScalarMappable(cmap=cmap_attn,
-                                     norm=plt.Normalize(vmin=attn_vmin, vmax=attn_vmax))
-        sm_a.set_array([])
-        fig.colorbar(sm_a, ax=ax, fraction=0.046, pad=0.04)
+        # Right-panel particle colors
+        _update_right_colors(right_rgba_per_tick[t])
+        title_right.set_text(f'cls→particle attention (tick {t}, mean over heads)')
 
-        fig.suptitle(f'ground truth: {class_names[this_target]}  '
-                     f'(shape=PID, fill=charge, size/α ∝ pt)', fontsize=11)
-        fig.tight_layout()
         fig.canvas.draw()
         img = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
         img = img.reshape(*reversed(fig.canvas.get_width_height()), 4)[:, :, :3]
-        frames.append(img)
-        plt.close(fig)
+        frames.append(img.copy())
+
+    plt.close(fig)
 
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     imageio.mimsave(out_path, frames, fps=4, loop=0)
