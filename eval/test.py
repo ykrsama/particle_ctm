@@ -573,31 +573,85 @@ def run_nlm_dynamics(model, per_class_samples, out_dir, device):
     }
 
 
-def run_saliency_gif(payload, out_dir):
-    """Render the saliency GIF from the payload returned by run_nlm_dynamics."""
-    if payload is None:
-        return
-    from particle_ctm.utils.visualization import make_saliency_gif
-    P_trimmed = payload['P_trimmed']
-    # Sample 0, channels × trimmed particles, to match attention/saliency shape.
-    x_feat_sample = payload['x_feat'][0][:, :P_trimmed]
-    make_saliency_gif(
-        payload['preds'], payload['certs'], payload['targets'],
-        attention_per_tick=payload['attn_stack'][:, 0],
-        saliency=payload['saliency'][:, 0],
-        masks=payload['viz_mask'],
-        x_feat=x_feat_sample,
-        class_names=CLASS_NAMES,
-        out_path=os.path.join(out_dir, 'saliency.gif'),
-        batch_index=0,
+def run_per_jet_saliency_gifs(model, per_class_samples, out_dir, device,
+                              chunk_size=4):
+    """Emit one saliency GIF per stashed jet, under <out_dir>/gif/.
+
+    Walks `per_class_samples` deterministically (class 0..C-1, then per-class
+    index 0..viz_per_class-1) and runs `compute_cls_saliency` in chunks to keep
+    the autograd graph footprint bounded. Each GIF is written as
+    `<class_name>_<jet_idx>.gif`.
+    """
+    from particle_ctm.utils.visualization import (
+        compute_cls_saliency, make_saliency_gif,
     )
+
+    jobs = []  # list of (cls, s_idx, sample_dict)
+    for cls in range(NUM_CLASSES):
+        for s_idx, s in enumerate(per_class_samples.get(cls, [])):
+            jobs.append((cls, s_idx, s))
+    if not jobs:
+        print('[test] per-jet saliency: no samples available')
+        return
+
+    gif_dir = os.path.join(out_dir, 'gif')
+    os.makedirs(gif_dir, exist_ok=True)
+
+    n_chunks = (len(jobs) + chunk_size - 1) // chunk_size
+    print(f'[test] per-jet saliency: {len(jobs)} jobs across '
+          f'{len({cls for cls, _, _ in jobs})} classes, '
+          f'chunk_size={chunk_size}, out={gif_dir}/')
+
+    for ci in range(n_chunks):
+        chunk = jobs[ci * chunk_size : (ci + 1) * chunk_size]
+        tag = ', '.join(f'{CLASS_NAMES[cls]}_{s_idx}' for cls, s_idx, _ in chunk)
+        print(f'[test] per-jet saliency: chunk {ci + 1}/{n_chunks}, jets={tag}')
+
+        try:
+            x_feat = torch.from_numpy(np.stack([s['x_feat'] for _, _, s in chunk])).to(device)
+            x_vec = torch.from_numpy(np.stack([s['x_vec'] for _, _, s in chunk])).to(device)
+            mask = torch.from_numpy(np.stack([s['mask'] for _, _, s in chunk])).to(device)
+            targets = torch.tensor([s['target'] for _, _, s in chunk])
+            x_feat.requires_grad_(False)
+            x_vec.requires_grad_(False)
+            model.train()  # enable autograd graph
+            preds, certs, attn_stack, _tok_acts, saliency = compute_cls_saliency(
+                model, x_feat, x_vec, mask)
+            model.eval()
+        except Exception as e:
+            print(f'[test] per-jet saliency: chunk {ci + 1} forward failed: {e}')
+            continue
+
+        P_trimmed = saliency.shape[-1]
+        x_feat_np = x_feat.detach().cpu().numpy()
+
+        for i, (cls, s_idx, _) in enumerate(chunk):
+            real_count = min(int(mask[i, 0].sum().item()), P_trimmed)
+            viz_mask = np.zeros(P_trimmed, dtype=np.float32)
+            viz_mask[:real_count] = 1.0
+            x_feat_sample = x_feat_np[i][:, :P_trimmed]
+            out_path = os.path.join(gif_dir, f'{CLASS_NAMES[cls]}_{s_idx:02d}.gif')
+            try:
+                make_saliency_gif(
+                    preds, certs, targets,
+                    attention_per_tick=attn_stack[:, i],
+                    saliency=saliency[:, i],
+                    masks=viz_mask,
+                    x_feat=x_feat_sample,
+                    class_names=CLASS_NAMES,
+                    out_path=out_path,
+                    batch_index=i,
+                )
+            except Exception as e:
+                print(f'[test] per-jet saliency: render failed for '
+                      f'{CLASS_NAMES[cls]}_{s_idx}: {e}')
 
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 def run_test(cfg, ckpt_path, output_dir, device=None,
-             max_batches=None, certainty_threshold=0.8, viz_per_class=1,
+             max_batches=None, certainty_threshold=0.8, viz_per_class=2,
              batch_size=1024):
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -674,16 +728,15 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
     plot_certainty_histogram(cert_above, os.path.join(output_dir, 'certainty_vs_tick.png'),
                              CLASS_NAMES, threshold=certainty_threshold)
 
-    viz_payload = None
     try:
-        viz_payload = run_nlm_dynamics(model, per_class_samples, output_dir, device)
+        run_nlm_dynamics(model, per_class_samples, output_dir, device)
     except Exception as e:
         print(f'[test] nlm dynamics failed: {e}')
 
     try:
-        run_saliency_gif(viz_payload, output_dir)
+        run_per_jet_saliency_gifs(model, per_class_samples, output_dir, device)
     except Exception as e:
-        print(f'[test] saliency gif failed: {e}')
+        print(f'[test] saliency gifs failed: {e}')
 
     #try:
     #    plot_particle_clouds(test_glob, NUM_CLASSES,
@@ -711,8 +764,9 @@ def main():
     parser.add_argument('--batch-size', type=int, default=4096,
                         help='Eval batch size (overrides cfg.train.batch_size).')
     parser.add_argument('--certainty-threshold', type=float, default=0.8)
-    parser.add_argument('--viz-per-class', type=int, default=1,
-                        help='Raw jets per class to stash for viz module.')
+    parser.add_argument('--viz-per-class', type=int, default=2,
+                        help='Raw jets per class to stash for viz module '
+                             '(controls how many saliency GIFs per class).')
     args = parser.parse_args()
 
     with open(args.config) as f:
