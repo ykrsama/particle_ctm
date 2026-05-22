@@ -152,9 +152,9 @@ def run_inference(model, loader, device, num_classes,
         total_batches = min(total_batches, max_batches)
     elif max_batches is not None:
         total_batches = max_batches
-    pbar = tqdm(loader, desc='infer', dynamic_ncols=True, unit='batch',
+    pbar = tqdm(desc='infer', dynamic_ncols=True, unit='batch',
                 total=total_batches)
-    for x_feat, x_vec, mask, y in pbar:
+    for x_feat, x_vec, mask, y in loader:
         x_feat = x_feat.to(device, non_blocking=True)
         x_vec = x_vec.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -193,6 +193,7 @@ def run_inference(model, loader, device, num_classes,
                 })
 
         n_batches += 1
+        pbar.update(1)
         if max_batches is not None and n_batches >= max_batches:
             break
 
@@ -474,12 +475,14 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
 # ---------------------------------------------------------------------------
 # Saliency / neural dynamics — delegate to utils/visualization.py
 # ---------------------------------------------------------------------------
-def run_visualization_module(model, per_class_samples, out_dir, device):
-    """Build one small batch (≤8 jets) and produce the saliency GIF + per-pool
-    neural-dynamics plots (q/k/v/o) from particle_ctm.utils.visualization.
+def run_nlm_dynamics(model, per_class_samples, out_dir, device):
+    """Forward pass with hooks to capture NLM post-activations + saliency.
+
+    Writes nlm_dynamics_{q,k,v,o}.png and returns a payload to feed to
+    `run_saliency_gif` later. Returns None if no samples are available.
     """
     from particle_ctm.utils.visualization import (
-        compute_cls_saliency, make_saliency_gif, plot_neural_dynamics_simple,
+        compute_cls_saliency, plot_neural_dynamics_simple,
     )
 
     pool = []
@@ -492,7 +495,7 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
             break
     if not pool:
         print('[test] visualization: no samples available')
-        return
+        return None
 
     x_feat = torch.from_numpy(np.stack([s['x_feat'] for s in pool])).to(device)
     x_vec = torch.from_numpy(np.stack([s['x_vec'] for s in pool])).to(device)
@@ -516,10 +519,10 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
         return _hook
 
     handles = [
-        model.ctm_attention.q_from_sync.register_forward_hook(_make_hook('q')),
-        model.ctm_attention.k_from_sync.register_forward_hook(_make_hook('k')),
-        model.ctm_attention.v_from_sync.register_forward_hook(_make_hook('v')),
-        model.ctm_attention.o_from_sync.register_forward_hook(_make_hook('o')),
+        model.ctm_attention.nlm_q.register_forward_hook(_make_hook('q')),
+        model.ctm_attention.nlm_k.register_forward_hook(_make_hook('k')),
+        model.ctm_attention.nlm_v.register_forward_hook(_make_hook('v')),
+        model.ctm_attention.nlm_o.register_forward_hook(_make_hook('o')),
     ]
     try:
         preds, certs, attn_stack, tok_acts, saliency = compute_cls_saliency(
@@ -538,20 +541,9 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
     viz_mask = np.zeros(P_trimmed, dtype=np.float32)
     viz_mask[:real_count] = 1.0
 
-    make_saliency_gif(
-        preds, certs, targets,
-        attention_per_tick=attn_stack[:, 0],
-        saliency=saliency[:, 0],
-        masks=viz_mask,
-        class_names=CLASS_NAMES,
-        out_path=os.path.join(out_dir, 'saliency.gif'),
-        batch_index=0,
-        top_k_particles=20,
-    )
-
-    # Per-pool neural dynamics. Hook outputs are (B*L, embed_dim) per tick;
-    # reshape to (T, B, L, embed_dim) which plot_neural_dynamics_simple
-    # overlays per-token (sample 0) with one random highlighted trace.
+    # Per-pool NLM post-activations. Hook outputs are (B*L, N_pool) per tick;
+    # reshape to (T, B, L, N_pool) which plot_neural_dynamics_simple overlays
+    # per-token (sample 0) with one random highlighted trace.
     B = len(pool)
     L = 1 + P_trimmed
     print(f'[plot] neural_dynamics: B={B}, L={L} (1+P_trimmed={P_trimmed}), '
@@ -561,7 +553,7 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
         if not acts:
             print(f'[plot] neural_dynamics_{name}: no activations captured, skipping')
             continue
-        stack = torch.stack(acts, dim=0)  # (T, B*L, embed_dim)
+        stack = torch.stack(acts, dim=0)  # (T, B*L, N_pool)
         T_, BL, D = stack.shape
         if BL != B * L:
             print(f'[plot] neural_dynamics_{name}: unexpected BL={BL} '
@@ -570,9 +562,31 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
         stack = stack.reshape(T_, B, L, D).numpy()
         plot_neural_dynamics_simple(
             stack,
-            os.path.join(out_dir, f'neural_dynamics_{name}.png'),
-            title=f'Neural dynamics — {name.upper()} pool (per-token overlay, sample 0)',
+            os.path.join(out_dir, f'nlm_dynamics_{name}.png'),
+            title=f'NLM post-activation — {name.upper()} pool (per-token overlay, sample 0)',
         )
+
+    return {
+        'preds': preds, 'certs': certs, 'targets': targets,
+        'attn_stack': attn_stack, 'saliency': saliency, 'viz_mask': viz_mask,
+    }
+
+
+def run_saliency_gif(payload, out_dir):
+    """Render the saliency GIF from the payload returned by run_nlm_dynamics."""
+    if payload is None:
+        return
+    from particle_ctm.utils.visualization import make_saliency_gif
+    make_saliency_gif(
+        payload['preds'], payload['certs'], payload['targets'],
+        attention_per_tick=payload['attn_stack'][:, 0],
+        saliency=payload['saliency'][:, 0],
+        masks=payload['viz_mask'],
+        class_names=CLASS_NAMES,
+        out_path=os.path.join(out_dir, 'saliency.gif'),
+        batch_index=0,
+        top_k_particles=20,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -648,12 +662,20 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
         json.dump(metrics, f, indent=2)
     print(f"[test] acc {test_acc:.4f}  AUC(macro,OvR) {test_auc:.4f}")
 
-    # Plots
+    # Plot order: fast diagnostic plots → NLM dynamics → particle clouds
+    # (slow ROOT re-read) → saliency GIF (slowest, plotted last).
     plot_roc(probs, targets,        os.path.join(output_dir, 'roc.png'),               CLASS_NAMES)
     plot_prc(probs, targets,        os.path.join(output_dir, 'prc.png'),               CLASS_NAMES)
     plot_confusion(probs, targets,  os.path.join(output_dir, 'confusion_matrix.png'),  CLASS_NAMES)
     plot_certainty_histogram(cert_above, os.path.join(output_dir, 'certainty_vs_tick.png'),
                              CLASS_NAMES, threshold=certainty_threshold)
+
+    viz_payload = None
+    try:
+        viz_payload = run_nlm_dynamics(model, per_class_samples, output_dir, device)
+    except Exception as e:
+        print(f'[test] nlm dynamics failed: {e}')
+
     try:
         plot_particle_clouds(test_glob, NUM_CLASSES,
                              os.path.join(output_dir, 'particle_clouds.png'),
@@ -661,11 +683,10 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
     except Exception as e:
         print(f'[test] particle_clouds failed: {e}')
 
-    # Saliency + neural-dynamics from utils/visualization.py.
     try:
-        run_visualization_module(model, per_class_samples, output_dir, device)
+        run_saliency_gif(viz_payload, output_dir)
     except Exception as e:
-        print(f'[test] visualization module failed: {e}')
+        print(f'[test] saliency gif failed: {e}')
 
     print(f'[test] outputs written to {output_dir}')
     return metrics
