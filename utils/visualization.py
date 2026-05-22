@@ -137,16 +137,16 @@ def compute_cls_saliency(model, x_feat, x_vec, mask):
 def make_saliency_gif(predictions, certainties, targets,
                      attention_per_tick, saliency, masks, x_feat,
                      class_names, out_path, batch_index=0,
-                     top_k_particles=20, smooth_window=5, max_heads=8):
+                     top_k_particles=20, max_heads=8):
     """Animate predictions + per-tick certainty + two η-φ overlays.
 
     Bottom-left: particle cloud (PID-shape / charge-fill / pt-size / pt-alpha)
-    underlay + per-head cumulative attention-focus arrow tracks (Spectral
-    colormap by tick, white halo + colored stroke a la
-    `make_classification_gif` in continuous-thought-machines).
+    underlay + per-head cumulative attention-focus arrows. Each arrow's color
+    equals the right-panel viridis color of its *source* focus particle at the
+    source tick.
 
     Bottom-right: same particle cloud, but each particle is colored by the
-    smoothed mean-over-heads attention at the current tick (viridis).
+    mean-over-heads attention at the current tick (raw, un-smoothed; viridis).
 
     attention_per_tick: (T, num_heads, P) for the chosen sample (already squeezed)
     saliency:           (T, P) for the chosen sample (kept for back-compat; no
@@ -184,35 +184,24 @@ def make_saliency_gif(predictions, certainties, targets,
         'mu': x_feat_np[_FEAT_ISMU_IDX, :P].astype(bool),
     }
 
-    # Sliding-window smoothing along T (matches make_classification_gif).
-    def _smooth(arr):
-        out = np.empty_like(arr, dtype=float)
-        for tt in range(arr.shape[0]):
-            lo = max(0, tt - (smooth_window - 1))
-            out[tt] = arr[lo:tt + 1].mean(axis=0)
-        return out
-
-    attn_per_head_smooth = _smooth(attention_per_tick.astype(float))  # (T, H, P)
-    # Use max-over-heads (not mean) for the right panel so values live in the
-    # same per-head softmax-probability range as focus-particle attention shown
-    # on the arrows. The mean is ~1/P (very small) and squashes everything to
-    # the bottom of the colormap when shared with the arrow scale.
-    attn_smooth = attn_per_head_smooth.max(axis=1)                    # (T, P)
+    # No temporal smoothing: each frame shows the model's state at tick t.
+    attn_per_head = attention_per_tick.astype(float)        # (T, H, P)
+    attn_t_per_particle = attn_per_head.mean(axis=1)        # (T, P)
 
     # Per-head focus particle per tick: argmax over real particles. Pads scored
     # as -inf so they are never picked.
     pad_mask = np.ones(P, dtype=bool)
     pad_mask[real_idx] = False
-    attn_for_argmax = attn_per_head_smooth.copy()
+    attn_for_argmax = attn_per_head.copy()
     attn_for_argmax[:, :, pad_mask] = -np.inf
     focus_idx = attn_for_argmax.argmax(axis=-1)  # (T, H)
 
-    # Shared color scale across both bottom panels. Includes both per-particle
-    # attention (right panel) and per-head focus-particle attention (left arrows).
-    attn_real = attn_smooth[:, real_idx]
-    focus_attn_all = np.take_along_axis(
-        attn_per_head_smooth, focus_idx[:, :, None], axis=-1).squeeze(-1)  # (T, H)
-    pool_for_scale = np.concatenate([attn_real.ravel(), focus_attn_all.ravel()])
+    # Shared color scale across both bottom panels: viridis over the same
+    # `attn_t_per_particle` field. An arrow leaving focus particle p at tick tt
+    # inherits the right panel's color of p at tick tt.
+    attn_real = attn_t_per_particle[:, real_idx]
+    focus_attn_all = attn_t_per_particle[np.arange(T)[:, None], focus_idx]  # (T, H)
+    pool_for_scale = attn_real.ravel()
     if pool_for_scale.size:
         attn_vmin = float(np.percentile(pool_for_scale, 2.0))
         attn_vmax = float(np.percentile(pool_for_scale, 99.0))
@@ -226,8 +215,8 @@ def make_saliency_gif(predictions, certainties, targets,
     print(f'[plot] saliency_gif: T={T}, heads={num_heads}, P={P}, '
           f'n_real={len(real_idx)}, batch_index={batch_index}, '
           f'out={out_path}')
-    print(f'[plot] saliency_gif: smooth_window={smooth_window}, '
-          f'max_heads={n_heads_show}, arrows@last_frame={n_arrows_final}, '
+    print(f'[plot] saliency_gif: max_heads={n_heads_show}, '
+          f'arrows@last_frame={n_arrows_final}, '
           f'shared attention range [{attn_vmin:.3g}, {attn_vmax:.3g}]')
 
     # Marker size + alpha from pt_log: standardised range is roughly [-3, 3].
@@ -247,9 +236,10 @@ def make_saliency_gif(predictions, certainties, targets,
     attn_norm_obj = plt.Normalize(vmin=attn_vmin, vmax=attn_vmax)
 
     # Precompute per-tick rgba arrays.
-    attn_smooth_norm = np.clip((attn_smooth[:, real_idx] - attn_vmin) /
-                               (attn_vmax - attn_vmin), 0.0, 1.0)
-    right_rgba_per_tick = cmap_attn(attn_smooth_norm)  # (T, n_real, 4)
+    right_norm_per_tick = np.clip(
+        (attn_t_per_particle[:, real_idx] - attn_vmin) /
+        (attn_vmax - attn_vmin), 0.0, 1.0)
+    right_rgba_per_tick = cmap_attn(right_norm_per_tick)  # (T, n_real, 4)
 
     # Arrow segments + colors, accumulated as we walk ticks.
     focus_attn_norm = np.clip((focus_attn_all - attn_vmin) /
@@ -351,7 +341,7 @@ def make_saliency_gif(predictions, certainties, targets,
     axR.set_aspect('equal')
     axR.set_xlabel(r'$\Delta\eta$', fontsize=9)
     axR.set_ylabel(r'$\Delta\varphi$', fontsize=9)
-    title_right = axR.set_title(f'cls→particle attention (tick 0, max over heads)')
+    title_right = axR.set_title(f'cls→particle attention (tick 0, mean over heads)')
     axR.grid(alpha=0.2)
     sm_R = plt.cm.ScalarMappable(cmap=cmap_attn, norm=attn_norm_obj)
     sm_R.set_array([])
@@ -405,7 +395,7 @@ def make_saliency_gif(predictions, certainties, targets,
 
         # Right-panel particle colors
         _update_right_colors(right_rgba_per_tick[t])
-        title_right.set_text(f'cls→particle attention (tick {t}, max over heads)')
+        title_right.set_text(f'cls→particle attention (tick {t}, mean over heads)')
 
         fig.canvas.draw()
         img = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
