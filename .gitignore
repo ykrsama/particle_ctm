@@ -2,6 +2,4 @@ __pycache__/
 datasets
 ckpts
 runs/*
-!runs/particle-ctm-submit-baseline0.1/best.pt
-!runs/particle-ctm-submit-baseline0.1/last.pt
-!runs/particle-ctm-submit-baseline0.1/test
+
