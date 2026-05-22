@@ -414,7 +414,8 @@ def build_dataloader(file_glob, batch_size, num_workers=4,
                      shuffle_buffer_size=20000,
                      num_concurrent_files=10,
                      rows_per_file_visit=10000,
-                     shard_by_rows=False):
+                     shard_by_rows=False,
+                     drop_last=True):
     ds = JetClassIterableDataset(
         file_glob,
         max_num_particles=max_num_particles,
@@ -430,7 +431,7 @@ def build_dataloader(file_glob, batch_size, num_workers=4,
     )
     return torch.utils.data.DataLoader(
         ds, batch_size=batch_size, num_workers=num_workers,
-        pin_memory=True, drop_last=True,
+        pin_memory=True, drop_last=drop_last,
     )
 
 

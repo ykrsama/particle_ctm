@@ -62,6 +62,8 @@ def make_saliency_gif(predictions, certainties, targets,
     masks:              (P,) 0/1
     """
     T, num_heads, P = attention_per_tick.shape
+    print(f'[plot] saliency_gif: T={T}, heads={num_heads}, P={P}, '
+          f'batch_index={batch_index}, top_k={top_k_particles}, out={out_path}')
     these_predictions = predictions[batch_index].detach().cpu().numpy()  # (C, T)
     these_certainties = certainties[batch_index].detach().cpu().numpy()  # (2, T)
     this_target = int(targets[batch_index])
@@ -130,31 +132,47 @@ def make_saliency_gif(predictions, certainties, targets,
 
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     imageio.mimsave(out_path, frames, fps=4, loop=0)
+    print(f'[plot] saliency_gif: saved {out_path} ({len(frames)} frames)')
     return out_path
 
 
-def plot_neural_dynamics_simple(token_activations, out_path, n_to_plot=80, n_per_row=10):
-    """Quick neuron-trace grid: mean over tokens → (T, B, embed_dim)."""
+def plot_neural_dynamics_simple(token_activations, out_path, n_to_plot=80,
+                                n_per_row=10, title=None):
+    """Per-neuron trace grid: overlay all token traces (sample 0) with one
+    randomly-highlighted solid curve on top — mirrors the overlay idiom in
+    continuous-thought-machines/tasks/image_classification/plotting.py."""
     th = np.asarray(token_activations)  # (T, B, 1+P, embed_dim)
-    if th.ndim == 4:
-        th = th.mean(axis=2)  # (T, B, embed_dim)
-    T, B, D = th.shape
+    print(f'[plot] neural_dynamics: input shape={th.shape}, n_to_plot={n_to_plot}, '
+          f'out={out_path}')
+    if th.ndim == 3:
+        th = th[:, :, None, :]  # treat as L=1
+    T, B, L, D = th.shape
     n_to_plot = min(n_to_plot, D)
     n_to_plot = (n_to_plot // n_per_row) * n_per_row
     n_rows = n_to_plot // n_per_row
 
+    palette = sns.color_palette('husl', 8)
     fig, axes = plt.subplots(n_rows, n_per_row, figsize=(n_per_row * 1.4, n_rows * 0.8),
                              sharex=True)
+    xs = np.arange(T)
     for i in range(n_to_plot):
         r, c = i // n_per_row, i % n_per_row
         ax = axes[r, c] if n_rows > 1 else axes[c]
-        ax.plot(th[:, 0, i], lw=1)
+        traces = th[:, 0, :, i].T  # (L, T)
+        color = palette[np.random.randint(0, 8)]
+        for tr in traces:
+            ax.plot(xs, tr, lw=0.6, alpha=0.15, color=color)
+        solid = traces[np.random.randint(0, L)]
+        ax.plot(xs, solid, color='white', lw=2.5, alpha=1)
+        ax.plot(xs, solid, color=color, lw=1.3, alpha=1)
+        ax.plot(xs, solid, color='black', lw=0.3, alpha=1)
         ax.set_xticks([])
         ax.set_yticks([])
         for s in ax.spines.values():
             s.set_visible(False)
-    fig.suptitle('Neural dynamics (mean over tokens, sample 0)')
+    fig.suptitle(title or 'Neural dynamics (per-token overlay, sample 0)')
     fig.tight_layout()
     fig.savefig(out_path, dpi=100, bbox_inches='tight')
     plt.close(fig)
+    print(f'[plot] neural_dynamics: saved {out_path}')
     return out_path

@@ -13,7 +13,7 @@ Produces (all under --output-dir):
     confusion_matrix.png 2D heatmap
     particle_clouds.png  10 jet types as point clouds (η, φ, PID, q, displacement)
     certainty_vs_tick.png histogram: per-tick count of jets with certainty>0.8
-    saliency.gif + neural_dynamics.png  from utils/visualization.py
+    saliency.gif + neural_dynamics_{q,k,v,o}.png  from utils/visualization.py
 
 Usage notes:
     - Loads config + checkpoint; both must match the model architecture.
@@ -110,10 +110,10 @@ def load_checkpoint(model, ckpt_path, device):
 # ---------------------------------------------------------------------------
 # Inference: collect predictions, certainties, raw samples for plots
 # ---------------------------------------------------------------------------
-def count_total_batches(test_glob, batch_size):
+def count_total_batches(test_glob, batch_size, drop_last=True):
     """Cheaply sum entries across all test ROOT files (num_entries is a header
-    read, no array decoding). Returns floor(total_entries / batch_size) to
-    match the DataLoader's drop_last=True."""
+    read, no array decoding). Returns the batch count matching the loader's
+    drop_last setting."""
     import glob as _glob
     import uproot
     files = sorted(_glob.glob(test_glob))
@@ -121,7 +121,9 @@ def count_total_batches(test_glob, batch_size):
     for fp in files:
         with uproot.open(fp) as f:
             total += int(f['tree'].num_entries)
-    return total // batch_size, total
+    if drop_last:
+        return total // batch_size, total
+    return (total + batch_size - 1) // batch_size, total
 
 
 @torch.inference_mode()
@@ -194,6 +196,7 @@ def run_inference(model, loader, device, num_classes,
         if max_batches is not None and n_batches >= max_batches:
             break
 
+    pbar.close()
     return (
         np.concatenate(all_preds, axis=0),
         np.concatenate(all_tgts, axis=0),
@@ -206,6 +209,8 @@ def run_inference(model, loader, device, num_classes,
 # Plots
 # ---------------------------------------------------------------------------
 def plot_roc(probs, targets, out_path, class_names):
+    print(f'[plot] roc: probs={probs.shape}, targets={targets.shape}, '
+          f'classes={len(class_names)}, out={out_path}')
     plt.figure(figsize=(7, 6))
     for c in range(probs.shape[1]):
         y_true = (targets == c).astype(int)
@@ -223,9 +228,12 @@ def plot_roc(probs, targets, out_path, class_names):
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
+    print(f'[plot] roc: saved {out_path}')
 
 
 def plot_prc(probs, targets, out_path, class_names):
+    print(f'[plot] prc: probs={probs.shape}, targets={targets.shape}, '
+          f'classes={len(class_names)}, out={out_path}')
     plt.figure(figsize=(7, 6))
     for c in range(probs.shape[1]):
         y_true = (targets == c).astype(int)
@@ -242,9 +250,12 @@ def plot_prc(probs, targets, out_path, class_names):
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
+    print(f'[plot] prc: saved {out_path}')
 
 
 def plot_confusion(probs, targets, out_path, class_names):
+    print(f'[plot] confusion: probs={probs.shape}, targets={targets.shape}, '
+          f'classes={len(class_names)}, out={out_path}')
     preds = probs.argmax(axis=1)
     cm = confusion_matrix(targets, preds, labels=list(range(len(class_names))))
     cm_norm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
@@ -260,11 +271,14 @@ def plot_confusion(probs, targets, out_path, class_names):
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
+    print(f'[plot] confusion: saved {out_path}')
 
 
 def plot_certainty_histogram(cert_above_per_class, out_path, class_names, threshold=0.8):
     cert_above_per_class = np.asarray(cert_above_per_class)
     C, T = cert_above_per_class.shape
+    print(f'[plot] certainty_hist: shape=(C={C}, T={T}), threshold={threshold}, '
+          f'out={out_path}')
     ticks = np.arange(T)
     plt.figure(figsize=(9, 4))
     bottom = np.zeros(T, dtype=cert_above_per_class.dtype)
@@ -280,6 +294,7 @@ def plot_certainty_histogram(cert_above_per_class, out_path, class_names, thresh
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
+    print(f'[plot] certainty_hist: saved {out_path}')
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +364,13 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
     up for mu), photon=pentagon. Filled = charged, hollow = neutral.
     Size ∝ energy. Color = displacement |d0|² + |dz|² (bluer = larger).
     """
+    print(f'[plot] particle_clouds: num_classes={num_classes}, '
+          f'max_num_particles={max_num_particles}, out={out_path}')
     samples = _read_raw_one_jet_per_class(test_glob, num_classes,
                                           max_num_particles=max_num_particles)
+    print(f'[plot] particle_clouds: loaded samples for {len(samples)}/{num_classes} classes')
     if not samples:
-        print('[test] particle_clouds: no samples loaded, skipping')
+        print('[plot] particle_clouds: no samples loaded, skipping')
         return None
 
     cols = 5
@@ -449,6 +467,7 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
     fig.tight_layout(rect=(0, 0.04, 1, 0.97))
     fig.savefig(out_path, dpi=130, bbox_inches='tight')
     plt.close(fig)
+    print(f'[plot] particle_clouds: saved {out_path}')
     return out_path
 
 
@@ -456,8 +475,8 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
 # Saliency / neural dynamics — delegate to utils/visualization.py
 # ---------------------------------------------------------------------------
 def run_visualization_module(model, per_class_samples, out_dir, device):
-    """Build one small batch (≤8 jets) and produce the saliency GIF + neural-
-    dynamics plot from particle_ctm.utils.visualization.
+    """Build one small batch (≤8 jets) and produce the saliency GIF + per-pool
+    neural-dynamics plots (q/k/v/o) from particle_ctm.utils.visualization.
     """
     from particle_ctm.utils.visualization import (
         compute_cls_saliency, make_saliency_gif, plot_neural_dynamics_simple,
@@ -484,8 +503,30 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
     x_feat.requires_grad_(False)
     x_vec.requires_grad_(False)
     model.train()  # enable autograd graph; we use no_grad inside utility helpers
-    preds, certs, attn_stack, tok_acts, saliency = compute_cls_saliency(
-        model, x_feat, x_vec, mask)
+
+    # Hook the four sync->embed projections so we can plot per-pool neural
+    # dynamics (q/k/v/o). Each hook fires once per outer CTM tick, producing
+    # a (B*L, embed_dim) tensor; we'll stack T of them and reshape to
+    # (T, B, L, embed_dim) for plot_neural_dynamics_simple.
+    pool_acts = {'q': [], 'k': [], 'v': [], 'o': []}
+
+    def _make_hook(name):
+        def _hook(_mod, _inp, out):
+            pool_acts[name].append(out.detach().cpu())
+        return _hook
+
+    handles = [
+        model.ctm_attention.q_from_sync.register_forward_hook(_make_hook('q')),
+        model.ctm_attention.k_from_sync.register_forward_hook(_make_hook('k')),
+        model.ctm_attention.v_from_sync.register_forward_hook(_make_hook('v')),
+        model.ctm_attention.o_from_sync.register_forward_hook(_make_hook('o')),
+    ]
+    try:
+        preds, certs, attn_stack, tok_acts, saliency = compute_cls_saliency(
+            model, x_feat, x_vec, mask)
+    finally:
+        for h in handles:
+            h.remove()
     model.eval()
 
     # SequenceTrimmer may have shrunk P inside the model. Saliency / attention
@@ -507,9 +548,31 @@ def run_visualization_module(model, per_class_samples, out_dir, device):
         batch_index=0,
         top_k_particles=20,
     )
-    plot_neural_dynamics_simple(
-        tok_acts, os.path.join(out_dir, 'neural_dynamics.png'),
-    )
+
+    # Per-pool neural dynamics. Hook outputs are (B*L, embed_dim) per tick;
+    # reshape to (T, B, L, embed_dim) which plot_neural_dynamics_simple
+    # overlays per-token (sample 0) with one random highlighted trace.
+    B = len(pool)
+    L = 1 + P_trimmed
+    print(f'[plot] neural_dynamics: B={B}, L={L} (1+P_trimmed={P_trimmed}), '
+          f'ticks per pool={ {k: len(v) for k, v in pool_acts.items()} }')
+    for name in ('q', 'k', 'v', 'o'):
+        acts = pool_acts[name]
+        if not acts:
+            print(f'[plot] neural_dynamics_{name}: no activations captured, skipping')
+            continue
+        stack = torch.stack(acts, dim=0)  # (T, B*L, embed_dim)
+        T_, BL, D = stack.shape
+        if BL != B * L:
+            print(f'[plot] neural_dynamics_{name}: unexpected BL={BL} '
+                  f'(expected {B*L}); skipping')
+            continue
+        stack = stack.reshape(T_, B, L, D).numpy()
+        plot_neural_dynamics_simple(
+            stack,
+            os.path.join(out_dir, f'neural_dynamics_{name}.png'),
+            title=f'Neural dynamics — {name.upper()} pool (per-token overlay, sample 0)',
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -538,12 +601,13 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
         max_num_particles=cfg['data']['max_num_particles'],
         shuffle=True,
         rank=0, world_size=1, seed=cfg['train']['seed'],
+        drop_last=True,
     )
 
     try:
         total_batches, total_entries = count_total_batches(test_glob, batch_size)
         print(f'[test] eval set: {total_entries} jets -> {total_batches} batches '
-              f'@ batch_size={batch_size} (drop_last=True)')
+              f'@ batch_size={batch_size}')
     except Exception as e:
         print(f'[test] could not pre-count entries ({e}); progress bar will be untotaled')
         total_batches = None
