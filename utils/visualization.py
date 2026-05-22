@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection
 import seaborn as sns
 import imageio
 from scipy.special import softmax
@@ -250,6 +249,31 @@ def make_saliency_gif(predictions, certainties, targets,
                               (attn_vmax - attn_vmin), 0.0, 1.0)
     arrow_rgba_full = cmap_attn(focus_attn_norm)  # (T, H, 4)
 
+    # Pre-compute all arrows (one per (transition tick, head)) so we can
+    # use a single persistent `quiver` artist with arrowheads and just toggle
+    # per-arrow alpha across frames.
+    n_trans = max(T - 1, 0)
+    if n_trans > 0 and n_heads_show > 0:
+        x0_arr = deta[focus_idx[:n_trans, :n_heads_show]].reshape(-1)
+        y0_arr = dphi[focus_idx[:n_trans, :n_heads_show]].reshape(-1)
+        x1_arr = deta[focus_idx[1:n_trans + 1, :n_heads_show]].reshape(-1)
+        y1_arr = dphi[focus_idx[1:n_trans + 1, :n_heads_show]].reshape(-1)
+        dx_arr = x1_arr - x0_arr
+        dy_arr = y1_arr - y0_arr
+        arrow_tick = np.repeat(np.arange(n_trans), n_heads_show)  # which tick each arrow belongs to
+        arrow_colors_full = arrow_rgba_full[:n_trans, :n_heads_show].reshape(-1, 4).copy()
+        # Drop zero-length arrows (would render as a dot).
+        keep = ~((dx_arr == 0) & (dy_arr == 0))
+        x0_arr = x0_arr[keep]; y0_arr = y0_arr[keep]
+        dx_arr = dx_arr[keep]; dy_arr = dy_arr[keep]
+        arrow_tick = arrow_tick[keep]
+        arrow_colors_full = arrow_colors_full[keep]
+    else:
+        x0_arr = y0_arr = dx_arr = dy_arr = np.zeros(0)
+        arrow_tick = np.zeros(0, dtype=int)
+        arrow_colors_full = np.zeros((0, 4))
+    n_arrows_total = len(x0_arr)
+
     pid_real = {k: v[real_idx] for k, v in pid_flags.items()}
     deta_real = deta[real_idx]
     dphi_real = dphi[real_idx]
@@ -276,17 +300,28 @@ def make_saliency_gif(predictions, certainties, targets,
     axes[0, 1].set_xlim([0, T - 1])
     axes[0, 1].set_ylim([0, 1])
 
-    # Bottom-left: particle cloud underlay + arrow LineCollections.
+    # Bottom-left: particle cloud underlay + persistent quiver arrows.
     axL = axes[1, 0]
     _draw_particle_cloud(axL, deta_real, dphi_real, pid_real,
                          sizes=sizes_real, colors=None, alpha=alpha_real,
                          edge_linewidth=0.6)
-    lc_halo = LineCollection([], colors='white', linewidths=2.6, alpha=0.95,
-                             zorder=3)
-    lc_color = LineCollection([], colors=[], linewidths=1.4, alpha=0.95,
-                              zorder=4)
-    axL.add_collection(lc_halo)
-    axL.add_collection(lc_color)
+    quiv_halo = None
+    quiv_color = None
+    if n_arrows_total > 0:
+        halo_rgba = np.tile(np.array([1.0, 1.0, 1.0, 0.0]), (n_arrows_total, 1))
+        color_rgba = arrow_colors_full.copy()
+        color_rgba[:, 3] = 0.0
+        # quiver scale_units='xy' + scale=1 makes (dx, dy) draw at true axis size.
+        quiv_halo = axL.quiver(
+            x0_arr, y0_arr, dx_arr, dy_arr, color=halo_rgba,
+            angles='xy', scale_units='xy', scale=1.0,
+            width=0.012, headwidth=4.5, headlength=5.5, headaxislength=5.0,
+            zorder=3)
+        quiv_color = axL.quiver(
+            x0_arr, y0_arr, dx_arr, dy_arr, color=color_rgba,
+            angles='xy', scale_units='xy', scale=1.0,
+            width=0.007, headwidth=4.0, headlength=5.0, headaxislength=4.5,
+            zorder=4)
     axL.set_xlim(-lim, lim); axL.set_ylim(-lim, lim)
     axL.set_aspect('equal')
     axL.set_xlabel(r'$\Delta\eta$', fontsize=9)
@@ -321,22 +356,14 @@ def make_saliency_gif(predictions, certainties, targets,
     fig.tight_layout()
 
     # ---- Per-tick artist updates only. ----
-    accum_segments = []
-    accum_colors = []
     frames = []
 
     def _update_right_colors(rgba_all):
-        # rgba_all is (n_real, 4). For each PID group handle, slice by its mask
-        # (which is N-shaped) -> then index into rgba_all (which is n_real-shaped)
-        # via the same group mask but applied within real indices.
-        # The handles dict was built from pid_real flags (already n_real-shaped),
-        # so the stored 'mask' is n_real-aligned.
         for grp in right_handles.values():
             sel = grp['mask']
             sub = rgba_all[sel]
             coll = grp['collection']
             if grp['fill'] == 'none':
-                # Hollow markers: only edgecolor encodes color; keep face='none'.
                 coll.set_edgecolors(sub)
             else:
                 coll.set_facecolors(sub)
@@ -352,25 +379,22 @@ def make_saliency_gif(predictions, certainties, targets,
         # Certainty cursor
         vline.set_xdata([t, t])
 
-        # Arrow accumulation: add new segments for tt = t-1 -> t (none on t==0).
-        if t > 0:
-            tt = t - 1
-            for h in range(n_heads_show):
-                p_prev = focus_idx[tt, h]
-                p_curr = focus_idx[tt + 1, h]
-                x0, y0 = float(deta[p_prev]), float(dphi[p_prev])
-                x1, y1 = float(deta[p_curr]), float(dphi[p_curr])
-                if x0 == x1 and y0 == y1:
-                    continue
-                accum_segments.append([(x0, y0), (x1, y1)])
-                accum_colors.append(arrow_rgba_full[tt, h])
-        lc_halo.set_segments(accum_segments)
-        lc_color.set_segments(accum_segments)
-        if accum_colors:
-            lc_color.set_colors(accum_colors)
+        # Reveal arrows whose source tick is < t by setting alpha.
+        if quiv_color is not None:
+            reveal = arrow_tick < t
+            halo_rgba = np.tile(np.array([1.0, 1.0, 1.0, 0.0]), (n_arrows_total, 1))
+            color_rgba = arrow_colors_full.copy()
+            color_rgba[:, 3] = 0.0
+            halo_rgba[reveal, 3] = 0.95
+            color_rgba[reveal, 3] = 0.95
+            quiv_halo.set_color(halo_rgba)
+            quiv_color.set_color(color_rgba)
+            n_visible = int(reveal.sum())
+        else:
+            n_visible = 0
         title_left.set_text(
             f'cls attention tracks (tick {t}, heads={n_heads_show}, '
-            f'arrows={len(accum_segments)})')
+            f'arrows={n_visible})')
 
         # Right-panel particle colors
         _update_right_colors(right_rgba_per_tick[t])
