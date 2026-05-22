@@ -193,7 +193,11 @@ def make_saliency_gif(predictions, certainties, targets,
         return out
 
     attn_per_head_smooth = _smooth(attention_per_tick.astype(float))  # (T, H, P)
-    attn_smooth = attn_per_head_smooth.mean(axis=1)                   # (T, P)
+    # Use max-over-heads (not mean) for the right panel so values live in the
+    # same per-head softmax-probability range as focus-particle attention shown
+    # on the arrows. The mean is ~1/P (very small) and squashes everything to
+    # the bottom of the colormap when shared with the arrow scale.
+    attn_smooth = attn_per_head_smooth.max(axis=1)                    # (T, P)
 
     # Per-head focus particle per tick: argmax over real particles. Pads scored
     # as -inf so they are never picked.
@@ -209,8 +213,11 @@ def make_saliency_gif(predictions, certainties, targets,
     focus_attn_all = np.take_along_axis(
         attn_per_head_smooth, focus_idx[:, :, None], axis=-1).squeeze(-1)  # (T, H)
     pool_for_scale = np.concatenate([attn_real.ravel(), focus_attn_all.ravel()])
-    attn_vmin = float(pool_for_scale.min()) if pool_for_scale.size else 0.0
-    attn_vmax = float(pool_for_scale.max()) if pool_for_scale.size else 1.0
+    if pool_for_scale.size:
+        attn_vmin = float(np.percentile(pool_for_scale, 2.0))
+        attn_vmax = float(np.percentile(pool_for_scale, 99.0))
+    else:
+        attn_vmin, attn_vmax = 0.0, 1.0
     if attn_vmax - attn_vmin < 1e-12:
         attn_vmax = attn_vmin + 1e-12
 
@@ -344,7 +351,7 @@ def make_saliency_gif(predictions, certainties, targets,
     axR.set_aspect('equal')
     axR.set_xlabel(r'$\Delta\eta$', fontsize=9)
     axR.set_ylabel(r'$\Delta\varphi$', fontsize=9)
-    title_right = axR.set_title(f'cls→particle attention (tick 0, mean over heads)')
+    title_right = axR.set_title(f'cls→particle attention (tick 0, max over heads)')
     axR.grid(alpha=0.2)
     sm_R = plt.cm.ScalarMappable(cmap=cmap_attn, norm=attn_norm_obj)
     sm_R.set_array([])
@@ -398,7 +405,7 @@ def make_saliency_gif(predictions, certainties, targets,
 
         # Right-panel particle colors
         _update_right_colors(right_rgba_per_tick[t])
-        title_right.set_text(f'cls→particle attention (tick {t}, mean over heads)')
+        title_right.set_text(f'cls→particle attention (tick {t}, max over heads)')
 
         fig.canvas.draw()
         img = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
