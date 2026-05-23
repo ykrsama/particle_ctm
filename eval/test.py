@@ -11,8 +11,8 @@ Produces (all under --output-dir):
     roc.png              one-vs-rest ROC for all 10 classes
     prc.png              one-vs-rest PRC
     confusion_matrix.png 2D heatmap
-    particle_clouds.png  10 jet types as point clouds (η, φ, PID, q, displacement)
-    certainty_vs_tick.png histogram: per-tick count of jets with certainty>0.8
+    particle_clouds.png  10 event types as point clouds (η, φ, PID, q, displacement)
+    certainty_vs_tick.png histogram: first tick at which event certainty exceeds 0.8 AND prediction is correct
     saliency.gif + neural_dynamics_{q,k,v,o}.png  from utils/visualization.py
 
 Usage notes:
@@ -133,10 +133,12 @@ def run_inference(model, loader, device, num_classes,
     """Single sweep through the test loader.
 
     Returns:
-        all_preds_softmax: (N_total, C) per-jet predicted probs at most-certain tick
+        all_preds_softmax: (N_total, C) per-event predicted probs at most-certain tick
         all_targets:       (N_total,)
-        cert_above_per_tick: (C, T) count of (jet, tick) where certainty > threshold,
-                             broken down by true class.
+        cert_above_per_tick: (C, T) count of events whose certainty first exceeds
+                             threshold AND prediction is correct at tick t,
+                             broken down by true class. Events that never
+                             cross-correctly are not counted.
         per_class_samples: dict[class_idx → list of {x_feat, x_vec, mask, target}]
                            one or more per class for the particle-cloud plot.
     """
@@ -175,8 +177,17 @@ def run_inference(model, loader, device, num_classes,
 
         if cert_above is None:
             cert_above = torch.zeros(num_classes, preds.size(-1), dtype=torch.long)
-        above = (certs[:, 1] > certainty_threshold).long().cpu()
-        cert_above.index_add_(0, y.cpu(), above)
+        # First tick where certainty > threshold AND the per-tick prediction is
+        # correct. Events that never cross-correctly are dropped.
+        above_mask = certs[:, 1] > certainty_threshold                   # (B, T)
+        correct_mask = preds.argmax(dim=1) == y.to(preds.device).unsqueeze(-1)  # (B, T)
+        hit_mask = above_mask & correct_mask                              # (B, T)
+        ever = hit_mask.any(dim=-1)                                       # (B,)
+        first_tick = hit_mask.int().argmax(dim=-1)                        # (B,)
+        B_, T_ = hit_mask.shape
+        onehot = torch.zeros(B_, T_, dtype=torch.long, device=hit_mask.device)
+        onehot[torch.arange(B_, device=hit_mask.device), first_tick] = ever.long()
+        cert_above.index_add_(0, y.cpu(), onehot.cpu())
 
         # Stash a few raw samples per class for the particle-cloud plot.
         for cls in range(num_classes):
@@ -288,8 +299,8 @@ def plot_certainty_histogram(cert_above_per_class, out_path, class_names, thresh
                 color=f'C{c}', alpha=0.85, label=class_names[c])
         bottom = bottom + cert_above_per_class[c]
     plt.xlabel('tick')
-    plt.ylabel(f'# jets with certainty > {threshold}')
-    plt.title(f'Certainty (>{threshold}) distribution across CTM ticks')
+    plt.ylabel(f'# events first correctly reaching certainty > {threshold}')
+    plt.title(f'First tick at which certainty > {threshold} AND prediction is correct')
     plt.legend(loc='upper right', fontsize=7, ncol=2)
     plt.grid(alpha=0.3, axis='y')
     plt.tight_layout()
@@ -301,8 +312,8 @@ def plot_certainty_histogram(cert_above_per_class, out_path, class_names, thresh
 # ---------------------------------------------------------------------------
 # Particle-cloud plot
 # ---------------------------------------------------------------------------
-def _read_raw_one_jet_per_class(test_glob, num_classes, max_num_particles=128):
-    """Walk a few ROOT shards from test_glob until we have one jet per class.
+def _read_raw_one_event_per_class(test_glob, num_classes, max_num_particles=128):
+    """Walk a few ROOT shards from test_glob until we have one event per class.
 
     Returns dict[cls -> dict with raw arrays]: px, py, pz, energy, eta, phi,
     deta, dphi, charge, isChargedHadron, isNeutralHadron, isPhoton, isElectron,
@@ -359,7 +370,7 @@ def _read_raw_one_jet_per_class(test_glob, num_classes, max_num_particles=128):
 
 
 def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128):
-    """One jet per class, particles drawn at (η, φ) (jet-relative deta/dphi).
+    """One event per class, particles drawn at (η, φ) (event-relative deta/dphi).
 
     Marker shape: hadron=circle, lepton (electron/muon)=triangle (down for e,
     up for mu), photon=pentagon. Filled = charged, hollow = neutral.
@@ -367,8 +378,8 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
     """
     print(f'[plot] particle_clouds: num_classes={num_classes}, '
           f'max_num_particles={max_num_particles}, out={out_path}')
-    samples = _read_raw_one_jet_per_class(test_glob, num_classes,
-                                          max_num_particles=max_num_particles)
+    samples = _read_raw_one_event_per_class(test_glob, num_classes,
+                                            max_num_particles=max_num_particles)
     print(f'[plot] particle_clouds: loaded samples for {len(samples)}/{num_classes} classes')
     if not samples:
         print('[plot] particle_clouds: no samples loaded, skipping')
@@ -401,11 +412,11 @@ def plot_particle_clouds(test_glob, num_classes, out_path, max_num_particles=128
         s = samples[cls]
         m = s['mask']
         if not m.any():
-            ax.text(0.5, 0.5, 'empty jet', transform=ax.transAxes,
+            ax.text(0.5, 0.5, 'empty event', transform=ax.transAxes,
                     ha='center', va='center')
             continue
 
-        # Use jet-relative coords (more compact, paper-style).
+        # Use event-relative coords (more compact, paper-style).
         x = s['deta'][m]
         y = s['dphi'][m]
         energy = np.clip(s['energy'][m], a_min=1e-3, a_max=None)
@@ -573,14 +584,14 @@ def run_nlm_dynamics(model, per_class_samples, out_dir, device):
     }
 
 
-def run_per_jet_saliency_gifs(model, per_class_samples, out_dir, device,
-                              chunk_size=4):
-    """Emit one saliency GIF per stashed jet, under <out_dir>/gif/.
+def run_per_event_saliency_gifs(model, per_class_samples, out_dir, device,
+                                chunk_size=4):
+    """Emit one saliency GIF per stashed event, under <out_dir>/gif/.
 
     Walks `per_class_samples` deterministically (class 0..C-1, then per-class
     index 0..viz_per_class-1) and runs `compute_cls_saliency` in chunks to keep
     the autograd graph footprint bounded. Each GIF is written as
-    `<class_name>_<jet_idx>.gif`.
+    `<class_name>_<event_idx>.gif`.
     """
     from particle_ctm.utils.visualization import (
         compute_cls_saliency, make_saliency_gif,
@@ -591,21 +602,21 @@ def run_per_jet_saliency_gifs(model, per_class_samples, out_dir, device,
         for s_idx, s in enumerate(per_class_samples.get(cls, [])):
             jobs.append((cls, s_idx, s))
     if not jobs:
-        print('[test] per-jet saliency: no samples available')
+        print('[test] per-event saliency: no samples available')
         return
 
     gif_dir = os.path.join(out_dir, 'gif')
     os.makedirs(gif_dir, exist_ok=True)
 
     n_chunks = (len(jobs) + chunk_size - 1) // chunk_size
-    print(f'[test] per-jet saliency: {len(jobs)} jobs across '
+    print(f'[test] per-event saliency: {len(jobs)} jobs across '
           f'{len({cls for cls, _, _ in jobs})} classes, '
           f'chunk_size={chunk_size}, out={gif_dir}/')
 
     for ci in range(n_chunks):
         chunk = jobs[ci * chunk_size : (ci + 1) * chunk_size]
         tag = ', '.join(f'{CLASS_NAMES[cls]}_{s_idx}' for cls, s_idx, _ in chunk)
-        print(f'[test] per-jet saliency: chunk {ci + 1}/{n_chunks}, jets={tag}')
+        print(f'[test] per-event saliency: chunk {ci + 1}/{n_chunks}, events={tag}')
 
         try:
             x_feat = torch.from_numpy(np.stack([s['x_feat'] for _, _, s in chunk])).to(device)
@@ -619,7 +630,7 @@ def run_per_jet_saliency_gifs(model, per_class_samples, out_dir, device,
                 model, x_feat, x_vec, mask)
             model.eval()
         except Exception as e:
-            print(f'[test] per-jet saliency: chunk {ci + 1} forward failed: {e}')
+            print(f'[test] per-event saliency: chunk {ci + 1} forward failed: {e}')
             continue
 
         P_trimmed = saliency.shape[-1]
@@ -643,7 +654,7 @@ def run_per_jet_saliency_gifs(model, per_class_samples, out_dir, device,
                     batch_index=i,
                 )
             except Exception as e:
-                print(f'[test] per-jet saliency: render failed for '
+                print(f'[test] per-event saliency: render failed for '
                       f'{CLASS_NAMES[cls]}_{s_idx}: {e}')
 
 
@@ -678,7 +689,7 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
 
     try:
         total_batches, total_entries = count_total_batches(test_glob, batch_size)
-        print(f'[test] eval set: {total_entries} jets -> {total_batches} batches '
+        print(f'[test] eval set: {total_entries} events -> {total_batches} batches '
               f'@ batch_size={batch_size}')
     except Exception as e:
         print(f'[test] could not pre-count entries ({e}); progress bar will be untotaled')
@@ -734,7 +745,7 @@ def run_test(cfg, ckpt_path, output_dir, device=None,
         print(f'[test] nlm dynamics failed: {e}')
 
     try:
-        run_per_jet_saliency_gifs(model, per_class_samples, output_dir, device)
+        run_per_event_saliency_gifs(model, per_class_samples, output_dir, device)
     except Exception as e:
         print(f'[test] saliency gifs failed: {e}')
 
@@ -765,7 +776,7 @@ def main():
                         help='Eval batch size (overrides cfg.train.batch_size).')
     parser.add_argument('--certainty-threshold', type=float, default=0.8)
     parser.add_argument('--viz-per-class', type=int, default=2,
-                        help='Raw jets per class to stash for viz module '
+                        help='Raw events per class to stash for viz module '
                              '(controls how many saliency GIFs per class).')
     args = parser.parse_args()
 
