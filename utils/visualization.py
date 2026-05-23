@@ -323,7 +323,7 @@ def make_saliency_gif(predictions, certainties, targets,
     axL.set_aspect('equal')
     axL.set_xlabel(r'$\Delta\eta$', fontsize=9)
     axL.set_ylabel(r'$\Delta\varphi$', fontsize=9)
-    title_left = axL.set_title(f'cls attention tracks (tick 0, heads={n_heads_show})')
+    title_left = axL.set_title(f'attention tracks (tick 0, heads={n_heads_show})')
     axL.grid(alpha=0.2)
     sm_L = plt.cm.ScalarMappable(cmap=cmap_attn, norm=attn_norm_obj)
     sm_L.set_array([])
@@ -390,8 +390,7 @@ def make_saliency_gif(predictions, certainties, targets,
         else:
             n_visible = 0
         title_left.set_text(
-            f'cls attention tracks (tick {t}, heads={n_heads_show}, '
-            f'arrows={n_visible})')
+            f'attention tracks (tick {t}, heads={n_heads_show})')
 
         # Right-panel particle colors
         _update_right_colors(right_rgba_per_tick[t])
