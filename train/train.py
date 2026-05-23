@@ -29,6 +29,7 @@ from particle_ctm.data.jetclass import (  # noqa: E402
 from particle_ctm.models.particle_ctm import (  # noqa: E402
     ParticleCTM, get_loss, calculate_accuracy,
 )
+from particle_ctm.models.particle_synapse import ParticleSynapse  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -61,13 +62,8 @@ def _confusion_plot(true_labels, pred_labels, num_classes, title):
     )
 
 
-def _small_param_log(base_model, step):
-    """Snapshot small but informative learnable params for wandb.
-
-    Covers per-head scalars (c_attn, log_tau / tau), sync-decay distributions
-    (decay_params_{q,k,v,o} as histograms + mean/std), QK-norm affine weights,
-    w_resid, and the cls_token. Cheap — runs at log_every cadence on rank 0 only.
-    """
+def _small_param_log_ctm(base_model, step):
+    """ParticleCTM-specific param snapshot for wandb."""
     import wandb as _wandb
     ca = base_model.ctm_attention
     out = {'step': step}
@@ -102,6 +98,40 @@ def _small_param_log(base_model, step):
     out['params/cls_token/mean'] = float(cls.mean())
     out['params/cls_token/std'] = float(cls.std())
     return out
+
+
+def _small_param_log_synapse(base_model, step):
+    """ParticleSynapse-specific param snapshot for wandb."""
+    import wandb as _wandb
+    syn = base_model.synapse
+    out = {'step': step}
+
+    t = syn.decay_params_out.detach().float().cpu()
+    out['params/decay_params_out/hist'] = _wandb.Histogram(t.numpy())
+    out['params/decay_params_out/mean'] = float(t.mean())
+    out['params/decay_params_out/std'] = float(t.std())
+
+    st = syn.start_trace.detach().float().cpu()
+    out['params/start_trace/mean'] = float(st.mean())
+    out['params/start_trace/std'] = float(st.std())
+    out['params/start_trace/norm'] = float(st.norm())
+
+    pte = base_model.prev_to_emb.weight.detach().float().cpu()
+    out['params/prev_to_emb/norm'] = float(pte.norm())
+
+    cls = base_model.cls_token.detach().float().cpu().flatten()
+    out['params/cls_token/norm'] = float(cls.norm())
+    out['params/cls_token/mean'] = float(cls.mean())
+    out['params/cls_token/std'] = float(cls.std())
+    return out
+
+
+def _small_param_log(base_model, step, model_type):
+    if model_type == 'particle_ctm':
+        return _small_param_log_ctm(base_model, step)
+    if model_type == 'particle_synapse':
+        return _small_param_log_synapse(base_model, step)
+    raise ValueError(f"Unknown model_type for param logging: {model_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +203,19 @@ def train_worker(cfg):
     from particle_ctm.models.particle_ctm import (
         ParticleCTM, get_loss, calculate_accuracy,
     )
+    from particle_ctm.models.particle_synapse import ParticleSynapse
 
-    rank = ray.train.get_context().get_world_rank()
-    world = ray.train.get_context().get_world_size()
-    device = ray.train.torch.get_device()
+    # Detect single-GPU debug mode: when main() invokes train_worker directly
+    # (no TorchTrainer), there's no Ray Train context, so the get_context()
+    # call below would raise. Fall back to rank=0, world=1, pick a local device.
+    single_gpu = bool(cfg.get('_single_gpu'))
+    if single_gpu:
+        rank, world = 0, 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        rank = ray.train.get_context().get_world_rank()
+        world = ray.train.get_context().get_world_size()
+        device = ray.train.torch.get_device()
 
     torch.manual_seed(cfg['train']['seed'] + rank)
 
@@ -211,7 +250,8 @@ def train_worker(cfg):
 
     # Model
     mcfg = cfg['model']
-    model = ParticleCTM(
+    model_type = mcfg.get('type', 'particle_ctm')
+    common_kwargs = dict(
         input_dim=mcfg['input_dim'],
         num_classes=mcfg['num_classes'],
         pair_input_dim=mcfg['pair_input_dim'],
@@ -221,22 +261,38 @@ def train_worker(cfg):
         use_pre_activation_pair=mcfg['use_pre_activation_pair'],
         num_heads=mcfg['num_heads'],
         iterations=mcfg['iterations'],
-        memory_length=mcfg['memory_length'],
-        memory_hidden_dims=mcfg.get('memory_hidden_dims', None),
-        d_model_qkv=mcfg['d_model_qkv'],
-        d_model_o=mcfg['d_model_o'],
-        n_synch_qkv=mcfg['n_synch_qkv'],
-        n_synch_o=mcfg['n_synch_o'],
         dropout=mcfg['dropout'],
-        qk_norm=mcfg.get('qk_norm', False),
-        scale_head=mcfg.get('scale_head', True),
-        scale_resid=mcfg.get('scale_resid', True),
         trim=mcfg['trim'],
         fc_params=tuple(tuple(x) for x in mcfg['fc_params']),
         activation=mcfg['activation'],
         use_grad_checkpoint=cfg['train'].get('use_grad_checkpoint', True),
-    ).to(device)
-    model = ray.train.torch.prepare_model(model)
+    )
+    if model_type == 'particle_ctm':
+        model = ParticleCTM(
+            **common_kwargs,
+            memory_length=mcfg['memory_length'],
+            memory_hidden_dims=mcfg.get('memory_hidden_dims', None),
+            d_model_qkv=mcfg['d_model_qkv'],
+            d_model_o=mcfg['d_model_o'],
+            n_synch_qkv=mcfg['n_synch_qkv'],
+            n_synch_o=mcfg['n_synch_o'],
+            qk_norm=mcfg.get('qk_norm', False),
+            scale_head=mcfg.get('scale_head', True),
+            scale_resid=mcfg.get('scale_resid', True),
+        ).to(device)
+    elif model_type == 'particle_synapse':
+        model = ParticleSynapse(
+            **common_kwargs,
+            d_ff=mcfg.get('d_ff', None),
+            memory_length=mcfg.get('synapse_memory_length',
+                                   mcfg.get('memory_length', 10)),
+            memory_hidden_dims=mcfg.get('synapse_memory_hidden_dims',
+                                        mcfg.get('memory_hidden_dims', 32)),
+            n_synch_out=mcfg.get('n_synch_out', 32),
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown model.type: {model_type!r}")
+    model = model if single_gpu else ray.train.torch.prepare_model(model)
 
     # Clamp decay params before every forward (CTM stability).
     base_model = model.module if hasattr(model, 'module') else model
@@ -262,11 +318,17 @@ def train_worker(cfg):
         print(f'{"trainable":40s} {trainable:12,d}', flush=True)
         print('=' * 72, flush=True)
 
-    def clamp_decay_params(_module, _input):
-        with torch.no_grad():
-            for name in ('decay_params_q', 'decay_params_k',
-                         'decay_params_v', 'decay_params_o'):
-                getattr(base_model.ctm_attention, name).data.clamp_(0, 15)
+    if model_type == 'particle_ctm':
+        def clamp_decay_params(_module, _input):
+            with torch.no_grad():
+                ca = base_model.ctm_attention
+                for name in ('decay_params_q', 'decay_params_k',
+                             'decay_params_v', 'decay_params_o'):
+                    getattr(ca, name).data.clamp_(0, 15)
+    else:  # particle_synapse
+        def clamp_decay_params(_module, _input):
+            with torch.no_grad():
+                base_model.synapse.decay_params_out.data.clamp_(0, 15)
     model.register_forward_pre_hook(clamp_decay_params)
 
     # Data — file-level sharding by rank.
@@ -503,7 +565,7 @@ def train_worker(cfg):
                                         'train confusion'),
                     'step': step,
                 })
-                wandb.log(_small_param_log(base_model, step))
+                wandb.log(_small_param_log(base_model, step, model_type))
             log_buf.clear()
 
         if step > 0 and step % cfg['train']['val_every'] == 0:
@@ -618,6 +680,7 @@ def main():
         return
 
     if args.single_gpu:
+        cfg['_single_gpu'] = True
         train_worker(cfg)
         if args.final_test:
             _run_final_test(cfg)

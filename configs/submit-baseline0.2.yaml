@@ -1,0 +1,119 @@
+# Default config for ParticleCTM on JetClass.
+
+data:
+  # Adjust these globs once your downloads finish.
+  train_glob: datasets/JetClass/Pythia/train_100M/*.root
+  val_glob:   datasets/JetClass/Pythia/val_5M/*.root
+  test_glob:  datasets/JetClass/Pythia/test_20M/*.root
+  max_num_particles: 128
+  num_workers: 8
+  # Rows held in the streaming shuffle buffer per DataLoader worker. Each
+  # JetClass shard file is class-pure (HToBB_*.root etc.), so we mix this
+  # many rows across many files before yielding to guarantee class-diverse
+  # batches. 0 disables (eval). ~11 KB per row × buffer_size × workers.
+  shuffle_buffer_size: 20000
+  # ROOT files held open at once per worker. PyTorch's IterableDataset
+  # guarantees each batch comes from ONE worker, so K must be ≥ num_classes
+  # if you want every batch to contain all classes. JetClass has 10 classes.
+  num_concurrent_files: 10
+  # Per-file row cap. Each slot holds only this many rows (subsampled, copied
+  # out, parent freed). Required when K is large: K=10 with full files would
+  # use ~11 GB per worker × 16 workers = 176 GB. With 10000 rows per visit,
+  # slot footprint drops to ~110 MB × K × workers ≈ 18 GB total. Set to null
+  # for full-file coverage per visit if you have the RAM.
+  rows_per_file_visit: 10000
+  # Train loader: stripe rows across all workers instead of partitioning the
+  # file list. With class-pure files (100 per class) and total_shards=16,
+  # file-level sharding gives 5–7 files/class/worker; the class with the
+  # fewest files exhausts ~80 % into the per-worker epoch and the K-slot
+  # fallback re-fills its slot from another class, so the single-batch label
+  # distribution drops 1–3 bins past ~10k steps. Row striping makes every
+  # worker see all files so no class can starve early.
+  train_shard_by_rows: true
+
+model:
+  # type selects which architecture to build.
+  # Valid: particle_ctm | particle_synapse.
+  # Keys outside the per-type comment block below are silently ignored by the
+  # other constructor, so flipping `type` is the only change needed to switch.
+  type: particle_synapse
+
+  # --- common to both ---
+  input_dim: 17
+  num_classes: 10
+  pair_input_dim: 4
+  pair_extra_dim: 0
+  embed_dims: [128, 512, 128]
+  pair_embed_dims: [64, 64, 64]
+  use_pre_activation_pair: false
+  num_heads: 8
+  iterations: 40
+  dropout: 0.0
+  trim: true
+  fc_params: []
+  activation: gelu
+
+  # --- particle_ctm only ---
+  memory_length: 15
+  memory_hidden_dims: null  # null = shallow NLM; int = deep NLM with this hidden dim
+  d_model_qkv: 128
+  d_model_o: 128
+  n_synch_qkv: 24
+  n_synch_o: 24
+  # qk_norm: false
+  # scale_head: true
+  # scale_resid: true
+
+  # --- particle_synapse only ---
+  d_ff: 1536                      # null => 4 * embed_dim
+  synapse_memory_length: 15       # falls back to memory_length if unset
+  synapse_memory_hidden_dims: null  # null => shallow NLM; falls back to memory_hidden_dims if unset
+  n_synch_out: 32
+
+train:
+  batch_size: 256
+  lr: 6.0e-4
+  weight_decay: 0.0 # 1.0e-4
+  warmup_steps: 300
+  total_steps:  250000
+  log_every: 50
+  val_every: 500
+  seed: 42
+  use_amp: true
+  # AMP dtype: bf16 | fp16 | none. bf16 has the same exponent range as fp32 so
+  # it won't overflow in the CTM sync recurrence; fp16 needs GradScaler and
+  # can NaN under long iterations.
+  amp_dtype: bf16
+  grad_clip: 20.0
+  # Gradient checkpointing on the CTM tick loop. Trades ~30-40% training time
+  # for huge activation memory savings (O(T) → O(1) ticks held in memory).
+  # Required at T=45, B=256 on 80 GB GPUs; set false only for small models.
+  use_grad_checkpoint: true
+  # Absolute path to a full-state checkpoint to resume from. Combined with a
+  # fixed `output.run_name`, this turns the same config into an idempotent
+  # submit-once-restart-as-needed workflow: on the first submission the file
+  # doesn't exist yet and training starts fresh silently; on resubmission the
+  # file is found and training continues with model + optimizer + scheduler +
+  # scaler + step + best_val_acc restored. Set null to disable.
+  resume_from: /fs-computility-new/UPDZ18_lishu/xlzhu/code/particle_ctm/runs/particle-ctm-submit-baseline0.2/last.pt
+
+ray:
+  num_workers: 8        # number of GPUs
+  use_gpu: true
+  resources_per_worker:
+    CPU: 8
+    GPU: 1
+
+wandb:
+  project: particle-ctm-jetclass
+  entity: null
+  mode: online           # online | offline | disabled
+
+output:
+  # Where checkpoints, wandb run files, and a config snapshot are written.
+  # Relative paths are resolved against the directory containing this yaml.
+  dir: runs
+  # Optional fixed run name. If null, a timestamp-based name is generated.
+  run_name: particle-ctm-submit-baseline0.2
+  ckpt_name: best.pt
+  save_last: true        # also write last.pt at end-of-training
